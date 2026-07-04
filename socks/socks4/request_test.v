@@ -92,3 +92,12 @@ fn test_reply_roundtrip() {
 	assert enc[0] == 0x00
 	assert parse_reply(enc)! == core.cd_granted
 }
+
+fn test_parse_reply_bad_vn_is_protocol_error() {
+	buf := [u8(1), core.cd_granted, 0, 0, 0, 0, 0, 0]
+	parse_reply(buf) or {
+		assert (err as core.SocksError).kind == .protocol_error
+		return
+	}
+	assert false
+}

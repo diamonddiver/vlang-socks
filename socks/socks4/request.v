@@ -92,5 +92,8 @@ pub fn parse_reply(buf []u8) !u8 {
 	if buf.len < 8 {
 		return core.err(.protocol_error, 'socks4: reply too short')
 	}
+	if buf[0] != 0 {
+		return core.err(.protocol_error, 'socks4: reply bad VN 0x${buf[0]:02x}')
+	}
 	return buf[1]
 }
