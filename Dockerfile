@@ -49,7 +49,20 @@ RUN git clone --depth 1 --branch ${V_VERSION} https://github.com/vlang/v /opt/v 
 WORKDIR /src
 # V caches compiled objects under ~/.cache; the Makefile mounts a volume there
 # so repeat `docker run`s are fast. Source is bind-mounted at run time.
-CMD ["v", "test", "socks"]
+#
+# -d net_nonblocking_sockets: without this compile-time flag, vlib/net creates
+# BLOCKING OS sockets (see vlib/net/udp.c.v: new_udp_socket only calls
+# set_blocking(sockfd, false) under this exact `$if` guard). On a blocking
+# socket, UdpConn.read()'s underlying recvfrom() never returns EWOULDBLOCK, so
+# the wait_for_read()-based deadline logic that set_read_timeout()/
+# set_read_deadline() rely on is never reached — those calls silently become
+# no-ops and a read with no incoming data blocks forever. Confirmed empirically
+# (Task 22): a UDP read with a 500ms timeout set hung indefinitely without this
+# flag, and returned a timeout error at ~500ms with it. The plan's Task 22
+# brief requires "every socket op is bounded by a short deadline"; this flag is
+# required for that to actually be true for UDP (TCP sockets are unaffected
+# either way, since their EWOULDBLOCK/EAGAIN path is reached regardless).
+CMD ["v", "-d", "net_nonblocking_sockets", "test", "socks"]
 
 # ---------------------------------------------------------------------------
 # Stage 2: build — compile the CLI with the pinned toolchain.
@@ -57,7 +70,9 @@ CMD ["v", "test", "socks"]
 # ---------------------------------------------------------------------------
 FROM dev AS build
 COPY . /src
-RUN mkdir -p /out && v -prod -o /out/vlang-socks cmd/vlang-socks
+# See the CMD comment above for why -d net_nonblocking_sockets is required for
+# UDP read timeouts/deadlines to actually take effect at runtime.
+RUN mkdir -p /out && v -prod -d net_nonblocking_sockets -o /out/vlang-socks cmd/vlang-socks
 
 # ---------------------------------------------------------------------------
 # Stage 3: runtime — tiny image with just the binary + libc. No toolchain, no

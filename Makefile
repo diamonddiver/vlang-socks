@@ -7,14 +7,21 @@ DOCKER_RUN := sudo docker run --rm -v $(CURDIR):/src -v $(CACHE_VOL):/root/.cach
 
 .PHONY: image test test-all vet fmt build run shell clean
 
+# -d net_nonblocking_sockets: required so UDP (and TCP) read timeouts/deadlines
+# actually take effect at runtime instead of silently no-op'ing — see the
+# matching comment on the Dockerfile's dev-stage CMD for the full explanation
+# (Task 22 found that UdpConn.set_read_timeout() blocks forever without this
+# flag, since vlib/net only makes sockets non-blocking under this exact guard).
+VFLAGS := -d net_nonblocking_sockets
+
 image:            ## Build the pinned dev toolchain image (cached after first run)
 	sudo docker build --target dev -t $(IMAGE) .
 
 test: image       ## Test one module:  make test MODULE=socks/socks5
-	$(DOCKER_RUN) $(IMAGE) v test $(MODULE)
+	$(DOCKER_RUN) $(IMAGE) v $(VFLAGS) test $(MODULE)
 
 test-all: image   ## Test every module
-	$(DOCKER_RUN) $(IMAGE) sh -c 'v test socks/core && v test socks/socks5 && v test socks/socks4 && v test socks/resolver && v test socks && v test cmd/vlang-socks'
+	$(DOCKER_RUN) $(IMAGE) sh -c 'v $(VFLAGS) test socks/core && v $(VFLAGS) test socks/socks5 && v $(VFLAGS) test socks/socks4 && v $(VFLAGS) test socks/resolver && v $(VFLAGS) test socks && v $(VFLAGS) test cmd/vlang-socks'
 
 vet: image        ## What CI checks: fmt-verify + vet
 	$(DOCKER_RUN) $(IMAGE) sh -c 'v fmt -verify socks cmd && v vet socks'
