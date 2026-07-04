@@ -1,0 +1,500 @@
+module socks
+
+import net
+import sync
+import picoev
+import socks.core
+import socks.socks5
+import socks.socks4
+import socks.resolver
+
+// Fd role in the event loop.
+enum FdRole {
+	listener
+	notify
+	client
+	target
+}
+
+// Relay is one proxied connection: a client side and (once connected) a target
+// side, driven by exactly one protocol state machine. @[heap] because every
+// Relay is allocated with &Relay{} and shared by pointer through the roles /
+// relays / pending maps — V requires heap-declared structs to store and reassign
+// mutable references to them across those maps.
+@[heap]
+struct Relay {
+mut:
+	client    &net.TcpConn = unsafe { nil }
+	target    &net.TcpConn = unsafe { nil }
+	client_fd int
+	target_fd int = -1
+	fam       ProtoFamily
+	m5        &socks5.Conn5 = unsafe { nil }
+	m4        &socks4.Conn4 = unsafe { nil }
+	relaying  bool
+	conn_id   u64 // id of this relay's outstanding resolver job (0 = none)
+}
+
+struct Server {
+mut:
+	cfg        ServerConfig
+	bound_addr string
+	listener   &net.TcpListener = unsafe { nil }
+	pool       resolver.Pool
+	pv         &picoev.Picoev = unsafe { nil }
+	// notify socket pair: reaper writes a byte, loop drains results.
+	notify_w  &net.TcpConn = unsafe { nil }
+	notify_r  &net.TcpConn = unsafe { nil }
+	notify_fd int
+	// fd bookkeeping (only mutated on the loop thread).
+	roles   map[int]FdRole
+	relays  map[int]&Relay // both client_fd and target_fd key the same Relay
+	next_id u64            // monotonic resolver-job id (NEVER an fd — avoids fd-reuse aliasing)
+	pending map[u64]&Relay // outstanding resolver jobs, keyed by job id
+	// results queue + stop flag (shared: guarded by qmu).
+	qmu      &sync.Mutex = sync.new_mutex()
+	results  []resolver.Result
+	stopping bool
+	// shutdown_done is loop-thread-only; guards shutdown() so pool.close() (which
+	// panics on a double-close of its channel) runs exactly once even though
+	// several notify bytes can arrive after stopping is set.
+	shutdown_done bool
+	// lifecycle
+	reaper_stop chan bool
+	loop_thr    thread
+	reaper_thr  thread
+}
+
+pub struct ServerHandle {
+mut:
+	srv &Server = unsafe { nil }
+}
+
+pub fn (h ServerHandle) addr() string {
+	return h.srv.bound_addr
+}
+
+pub fn (mut h ServerHandle) stop() {
+	h.srv.request_stop()
+}
+
+// wait blocks until the server's owned resources are cleaned up. Because this
+// picoev version offers no way to break serve()'s infinite loop, the OS thread
+// running the accept loop is intentionally left running as an unreclaimed daemon
+// thread until process exit — wait() does NOT join it. wait() therefore does
+// NOT guarantee that the picoev accept loop has stopped; it only guarantees the
+// resolver workers have been signalled to stop and the results reaper has exited.
+// The real proxy listener (s.listener) IS closed by stop(), so the proxy port
+// stops accepting new connections promptly, but the picoev loop thread itself
+// keeps running.
+pub fn (mut h ServerHandle) wait() {
+	h.srv.reaper_thr.wait()
+}
+
+// spawn_serve starts the listener and event loop without blocking.
+pub fn spawn_serve(cfg ServerConfig) !ServerHandle {
+	validate_server_config(cfg)!
+	mut l := net.listen_tcp(.ip, cfg.addr) or {
+		return error('socks: cannot bind ${cfg.addr}: ${err.msg()}')
+	}
+	bound := l.addr()!.str()
+	// notify socket pair over loopback.
+	np_r, np_w := make_notify_pair()!
+	mut srv := &Server{
+		cfg:         cfg
+		bound_addr:  bound
+		listener:    l
+		pool:        resolver.new(cfg.resolver_threads)
+		notify_r:    np_r
+		notify_w:    np_w
+		reaper_stop: chan bool{cap: 1}
+	}
+	srv.notify_fd = np_r.sock.handle
+	srv.start()!
+	return ServerHandle{
+		srv: srv
+	}
+}
+
+// serve is the blocking wrapper.
+pub fn serve(cfg ServerConfig) ! {
+	mut h := spawn_serve(cfg)!
+	h.wait()
+}
+
+fn (mut s Server) start() ! {
+	// picoev.new always creates+binds its OWN internal listener; port:0 keeps it
+	// on an ephemeral, never-used port so repeated spawn_serve calls don't clash
+	// on a fixed port (Spike B). We never route through picoev's own listener —
+	// the real listener and every client/target fd are registered explicitly via
+	// pv.add() with the low-level fn (int, int, voidptr) callback. Config.cb
+	// (HTTP-mode) and Config.raw_cb (internal-accept-only) are both the wrong hook
+	// and are deliberately left unset.
+	mut pv := picoev.new(picoev.Config{
+		user_data: s
+		port:      0
+		family:    .ip
+	})!
+	s.pv = pv
+	// Register listener and notify read-end as raw fds.
+	s.roles[s.listener.sock.handle] = .listener
+	pv_add(mut pv, s.listener.sock.handle)
+	s.roles[s.notify_fd] = .notify
+	pv_add(mut pv, s.notify_fd)
+	// Run the event loop and the results reaper on their own threads.
+	s.loop_thr = spawn s.run_loop()
+	s.reaper_thr = spawn s.reap()
+}
+
+fn (mut s Server) run_loop() {
+	s.pv.serve() // never returns (Spike B): picoev has no loop-stop primitive
+}
+
+// reap forwards resolver results to the loop and wakes it. It exits on an
+// explicit reaper_stop signal rather than on `results` closing: workers may
+// still be writing in-flight results to `results` during shutdown, so closing
+// that channel would risk a send-on-closed panic. select lets the reaper unblock
+// immediately when stop is requested, so wait() can always join it (no hang).
+fn (mut s Server) reap() {
+	for {
+		select {
+			r := <-s.pool.results {
+				s.qmu.@lock()
+				s.results << r
+				s.qmu.unlock()
+				s.notify_w.write([u8(1)]) or {}
+			}
+			_ := <-s.reaper_stop {
+				break
+			}
+		}
+	}
+}
+
+fn (mut s Server) request_stop() {
+	s.qmu.@lock()
+	already := s.stopping
+	s.stopping = true
+	s.qmu.unlock()
+	if already {
+		// Idempotent: a second stop() must not re-send on the cap-1 reaper_stop
+		// channel (its receiver has already exited → the send would block
+		// forever) or double-close the listener.
+		return
+	}
+	// NOTE: pool.close() is intentionally NOT called here. submit() is only ever
+	// called on the loop thread (via apply()), and closing the pool's channel
+	// concurrently with a submit() panics the whole process (see resolver.submit /
+	// resolver.close doc comments). request_stop() runs on an arbitrary external
+	// caller thread, so it must not touch the pool. Instead we wake the loop and
+	// let shutdown() — which runs ON the loop thread — call pool.close(), where it
+	// cannot race a concurrent submit().
+	s.reaper_stop <- true // unblock the reaper's select so wait() can join it
+	s.notify_w.write([u8(9)]) or {} // wake the loop so on_notify observes `stopping`
+	s.listener.close() or {}
+}
+
+// raw_cb is picoev's per-fd event entry point. Signature per Spike B:
+// fn (fd int, events int, context voidptr), where context is &Picoev. Recover
+// the Picoev, then our Server from pv.user_data.
+fn raw_cb(fd int, events int, context voidptr) {
+	mut pv := unsafe { &picoev.Picoev(context) }
+	mut s := unsafe { &Server(pv.user_data) }
+	role := s.roles[fd] or { return }
+	match role {
+		.listener { s.on_accept(mut pv) }
+		.notify { s.on_notify(mut pv) }
+		.client { s.on_client_readable(mut pv, fd) }
+		.target { s.on_target_readable(mut pv, fd) }
+	}
+}
+
+fn (mut s Server) on_accept(mut pv picoev.Picoev) {
+	mut c := s.listener.accept() or { return }
+	fd := c.sock.handle
+	mut r := &Relay{
+		client:    c
+		client_fd: fd
+	}
+	s.relays[fd] = r
+	s.roles[fd] = .client
+	pv_add(mut pv, fd)
+}
+
+fn (mut s Server) on_client_readable(mut pv picoev.Picoev, fd int) {
+	mut r := s.relays[fd] or { return }
+	data := read_some(mut r.client) or {
+		s.close_relay(mut pv, mut r)
+		return
+	}
+	if data.len == 0 {
+		s.close_relay(mut pv, mut r)
+		return
+	}
+	if r.relaying {
+		// forward client -> target
+		if r.target_fd >= 0 {
+			r.target.write(data) or { s.close_relay(mut pv, mut r) }
+		}
+		return
+	}
+	s.drive(mut pv, mut r, data)
+}
+
+// drive feeds bytes to the connection's state machine, choosing the protocol on
+// the first byte, and acts on the resulting Action.
+fn (mut s Server) drive(mut pv picoev.Picoev, mut r Relay, data []u8) {
+	mut feed := data.clone()
+	if r.m5 == unsafe { nil } && r.m4 == unsafe { nil } {
+		fam := dispatch_family(feed[0], s.cfg) or {
+			s.close_relay(mut pv, mut r)
+			return
+		}
+		r.fam = fam
+		if fam == .socks5 {
+			r.m5 = &socks5.Conn5{
+				cfg:   s.socks5_cfg()
+				stage: .handshake
+			}
+		} else {
+			r.m4 = &socks4.Conn4{
+				cfg:   s.socks4_cfg()
+				stage: .request
+			}
+		}
+	}
+	act := if r.fam == .socks5 {
+		r.m5.feed(feed) or {
+			s.close_relay(mut pv, mut r)
+			return
+		}
+	} else {
+		r.m4.feed(feed) or {
+			s.close_relay(mut pv, mut r)
+			return
+		}
+	}
+	s.apply(mut pv, mut r, act)
+}
+
+fn (mut s Server) apply(mut pv picoev.Picoev, mut r Relay, act core.Action) {
+	if act.reply.len > 0 {
+		r.client.write(act.reply) or {
+			s.close_relay(mut pv, mut r)
+			return
+		}
+	}
+	if act.close {
+		s.close_relay(mut pv, mut r)
+		return
+	}
+	if act.udp_associate {
+		// UDP relay is implemented in Task 20. Until then, refuse cleanly.
+		s.fail_relay(mut pv, mut r, .command_not_supported)
+		return
+	}
+	if t := act.connect {
+		s.next_id++
+		r.conn_id = s.next_id
+		s.pending[r.conn_id] = r
+		s.pool.submit(resolver.Job{
+			id:     r.conn_id
+			target: t
+		})
+	}
+}
+
+fn (mut s Server) on_notify(mut pv picoev.Picoev) {
+	mut drain := []u8{len: 64}
+	s.notify_r.read(mut drain) or {}
+	s.qmu.@lock()
+	stopping := s.stopping
+	batch := s.results.clone()
+	s.results = []
+	s.qmu.unlock()
+	if stopping {
+		s.shutdown(mut pv)
+		return
+	}
+	for res in batch {
+		s.on_result(mut pv, res)
+	}
+}
+
+fn (mut s Server) on_result(mut pv picoev.Picoev, res resolver.Result) {
+	// Look the relay up by the unique job id, not the fd: a client can vanish
+	// mid-resolve and its fd be reused by a fresh accept before this result
+	// lands, so keying on fd would attach the target to the wrong connection.
+	mut r := s.pending[res.id] or {
+		// Client already gone: close_relay dropped the pending entry while this
+		// job was in flight. If the resolver still produced a connected socket,
+		// close it here — otherwise its fd leaks (no relay owns it).
+		if mut orphan := res.conn {
+			orphan.close() or {}
+		}
+		return
+	}
+	s.pending.delete(res.id)
+	r.conn_id = 0
+	if tconn := res.conn {
+		r.target = tconn
+		r.target_fd = tconn.sock.handle
+		bound := socks5.Addr{
+			atyp: .ipv4
+			host: '0.0.0.0'
+			port: 0
+		}
+		act := if r.fam == .socks5 {
+			r.m5.on_connected(bound)
+		} else {
+			r.m4.on_connected()
+		}
+		r.client.write(act.reply) or {
+			s.close_relay(mut pv, mut r)
+			return
+		}
+		r.relaying = true
+		// Flush any client bytes that arrived pipelined before the reply. They
+		// were buffered in the state machine (the request-parsing loop leaves the
+		// post-request tail in `buf`, and any bytes read while .pending are
+		// appended there too), NOT lost — but nothing forwards them unless we do
+		// it here, before the first fresh client readable event. Without this a
+		// client that sends CONNECT + payload in one segment loses the payload.
+		mut leftover := if r.fam == .socks5 { r.m5.buf } else { r.m4.buf }
+		if leftover.len > 0 {
+			r.target.write(leftover) or {
+				s.close_relay(mut pv, mut r)
+				return
+			}
+			if r.fam == .socks5 {
+				r.m5.buf = []u8{}
+			} else {
+				r.m4.buf = []u8{}
+			}
+		}
+		s.relays[r.target_fd] = r
+		s.roles[r.target_fd] = .target
+		pv_add(mut pv, r.target_fd)
+	} else {
+		kind := if e := res.err { e.kind } else { core.SocksErrorCode.general_failure }
+		s.fail_relay(mut pv, mut r, kind)
+	}
+}
+
+fn (mut s Server) on_target_readable(mut pv picoev.Picoev, fd int) {
+	mut r := s.relays[fd] or { return }
+	data := read_some(mut r.target) or {
+		s.close_relay(mut pv, mut r)
+		return
+	}
+	if data.len == 0 {
+		s.close_relay(mut pv, mut r)
+		return
+	}
+	r.client.write(data) or { s.close_relay(mut pv, mut r) }
+}
+
+fn (mut s Server) fail_relay(mut pv picoev.Picoev, mut r Relay, kind core.SocksErrorCode) {
+	act := if r.fam == .socks5 {
+		r.m5.on_failed(kind)
+	} else {
+		r.m4.on_failed(kind)
+	}
+	r.client.write(act.reply) or {}
+	s.close_relay(mut pv, mut r)
+}
+
+fn (mut s Server) close_relay(mut pv picoev.Picoev, mut r Relay) {
+	if r.conn_id != 0 {
+		s.pending.delete(r.conn_id)
+		r.conn_id = 0
+	}
+	if r.client_fd >= 0 {
+		pv_del(mut pv, r.client_fd)
+		s.roles.delete(r.client_fd)
+		s.relays.delete(r.client_fd)
+		r.client.close() or {}
+		r.client_fd = -1 // idempotent: a second close_relay on this relay is a no-op
+	}
+	if r.target_fd >= 0 {
+		pv_del(mut pv, r.target_fd)
+		s.roles.delete(r.target_fd)
+		s.relays.delete(r.target_fd)
+		r.target.close() or {}
+		r.target_fd = -1
+	}
+}
+
+fn (mut s Server) shutdown(mut pv picoev.Picoev) {
+	// Idempotent: several notify bytes can arrive after `stopping` is set (the
+	// reaper may forward an in-flight result and the stop path also writes one),
+	// each waking on_notify → shutdown. pool.close() panics on a double-close of
+	// its channel, so guard the whole body to run exactly once.
+	if s.shutdown_done {
+		return
+	}
+	s.shutdown_done = true
+	// Close every live relay (client + target) so no fd leaks across repeated
+	// spawn_serve/stop cycles in a test suite. relays keys each connection by both
+	// its fds, so we iterate over a snapshot of the keys and re-look-up in the live
+	// map: close_relay deletes both keys of a relay, so the second key hits the
+	// `or { continue }` and is skipped.
+	for fd, _ in s.relays.clone() {
+		mut r := s.relays[fd] or { continue }
+		s.close_relay(mut pv, mut r)
+	}
+	// Shut the resolver pool down here — on the loop thread, the ONLY thread that
+	// ever calls submit() — so pool.close() can never race a concurrent submit().
+	s.pool.close()
+}
+
+fn (s Server) socks5_cfg() socks5.Conn5Config {
+	is_up := s.cfg.auth is UserPassAuth
+	mut user := ''
+	mut pass := ''
+	if is_up {
+		up := s.cfg.auth as UserPassAuth
+		user = up.user
+		pass = up.pass
+	}
+	return socks5.Conn5Config{
+		require_userpass: is_up
+		username:         user
+		password:         pass
+		allow_udp:        s.cfg.allow_udp
+	}
+}
+
+fn (s Server) socks4_cfg() socks4.Conn4Config {
+	return socks4.Conn4Config{
+		allow_plain: SocksVersion.v4 in s.cfg.versions
+		allow_4a:    SocksVersion.v4a in s.cfg.versions
+	}
+}
+
+// read_some reads whatever is currently available (picoev signalled readable).
+fn read_some(mut c net.TcpConn) ![]u8 {
+	mut buf := []u8{len: 4096}
+	n := c.read(mut buf) or { return err }
+	return buf[..n].clone()
+}
+
+// --- picoev primitives (adapted to the API confirmed in Spike B) ---
+
+fn pv_add(mut pv picoev.Picoev, fd int) {
+	pv.add(fd, picoev.picoev_read, 0, raw_cb)
+}
+
+fn pv_del(mut pv picoev.Picoev, fd int) {
+	pv.delete(fd)
+}
+
+// make_notify_pair builds a connected loopback TCP pair used to wake the loop.
+fn make_notify_pair() !(&net.TcpConn, &net.TcpConn) {
+	mut l := net.listen_tcp(.ip, '127.0.0.1:0')!
+	addr := l.addr()!.str()
+	mut w := net.dial_tcp(addr)!
+	mut r := l.accept()!
+	l.close() or {}
+	return r, w
+}
