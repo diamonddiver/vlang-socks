@@ -38,10 +38,26 @@ pub fn new(nworkers int) Pool {
 	return p
 }
 
+// submit enqueues job for a worker to pick up.
+//
+// Precondition: submit() must never be called after, or concurrently with,
+// close(). Closing a V channel while a push is in flight (or afterwards)
+// makes the push panic the whole process with `panic('push on closed
+// channel')` — there is no recoverable error path, since this method's
+// signature (per the spec) returns nothing to report failure with.
+// Callers own this sequencing: only close() the pool from the same
+// single thread/context that calls submit(), and only after that context
+// has permanently stopped issuing new submit() calls.
 pub fn (mut p Pool) submit(job Job) {
 	p.jobs <- job
 }
 
+// close shuts down the jobs channel, signalling workers to exit once they
+// drain any already-queued jobs.
+//
+// Precondition: see submit() — the caller must guarantee no submit() call
+// is in flight or issued after close() is called, or the next submit()
+// will panic on the closed channel.
 pub fn (mut p Pool) close() {
 	p.jobs.close()
 }
