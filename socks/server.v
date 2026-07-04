@@ -14,6 +14,7 @@ enum FdRole {
 	notify
 	client
 	target
+	udp
 }
 
 // Relay is one proxied connection: a client side and (once connected) a target
@@ -33,6 +34,11 @@ mut:
 	m4        &socks4.Conn4 = unsafe { nil }
 	relaying  bool
 	conn_id   u64 // id of this relay's outstanding resolver job (0 = none)
+	// UDP association fields (SOCKS5 UDP ASSOCIATE)
+	udp        &net.UdpConn = unsafe { nil }
+	udp_fd     int          = -1
+	is_udp     bool
+	client_udp string
 }
 
 struct Server {
@@ -206,6 +212,7 @@ fn raw_cb(fd int, events int, context voidptr) {
 		.notify { s.on_notify(mut pv) }
 		.client { s.on_client_readable(mut pv, fd) }
 		.target { s.on_target_readable(mut pv, fd) }
+		.udp { s.on_udp_readable(mut pv, fd) }
 	}
 }
 
@@ -289,8 +296,7 @@ fn (mut s Server) apply(mut pv picoev.Picoev, mut r Relay, act core.Action) {
 		return
 	}
 	if act.udp_associate {
-		// UDP relay is implemented in Task 20. Until then, refuse cleanly.
-		s.fail_relay(mut pv, mut r, .command_not_supported)
+		s.start_udp(mut pv, mut r)
 		return
 	}
 	if t := act.connect {
@@ -422,6 +428,13 @@ fn (mut s Server) close_relay(mut pv picoev.Picoev, mut r Relay) {
 		s.relays.delete(r.target_fd)
 		r.target.close() or {}
 		r.target_fd = -1
+	}
+	if r.udp_fd >= 0 {
+		pv_del(mut pv, r.udp_fd)
+		s.roles.delete(r.udp_fd)
+		s.relays.delete(r.udp_fd)
+		r.udp.close() or {}
+		r.udp_fd = -1
 	}
 }
 
