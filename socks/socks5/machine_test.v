@@ -57,6 +57,7 @@ fn test_no_acceptable_method() {
 	a := m.feed(encode_hello([u8(method_no_auth)]))! // client offers only no-auth
 	assert a.reply == encode_method_select(method_none)
 	assert a.close
+	assert m.stage == .closed
 }
 
 fn test_userpass_success_then_connect() {
@@ -88,6 +89,7 @@ fn test_userpass_failure_closes() {
 	a := m.feed(encode_userpass(UserPass{ user: 'u', pass: 'WRONG' }))!
 	assert a.reply == encode_userpass_reply(false)
 	assert a.close
+	assert m.stage == .closed
 }
 
 fn test_bind_command_not_supported() {

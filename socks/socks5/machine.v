@@ -80,6 +80,7 @@ fn (mut m Conn5) step_handshake() !core.Action {
 	m.buf = m.buf[n..].clone()
 	want := if m.cfg.require_userpass { method_user_pass } else { method_no_auth }
 	if want !in h.methods {
+		m.stage = .closed
 		return core.Action{
 			reply: encode_method_select(method_none)
 			close: true
@@ -100,6 +101,7 @@ fn (mut m Conn5) step_auth() !core.Action {
 	m.buf = m.buf[n..].clone()
 	ok := up.user == m.cfg.username && up.pass == m.cfg.password
 	if !ok {
+		m.stage = .closed
 		return core.Action{
 			reply: encode_userpass_reply(false)
 			close: true
