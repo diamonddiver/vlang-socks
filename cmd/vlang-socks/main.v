@@ -24,6 +24,13 @@ fn parse_versions(s string) ![]socks.SocksVersion {
 }
 
 fn main() {
+	// Docker's default `docker run -d` (detached, non-TTY) gives the process
+	// a pipe for stdout, which glibc fully-buffers rather than line-buffers.
+	// Without this, neither the startup line nor any log_connections output
+	// reaches `docker logs` promptly — only once the buffer fills or the
+	// process exits. Force unbuffered stdout so logs are visible in real time.
+	C.setvbuf(C.stdout, unsafe { nil }, C._IONBF, 0)
+
 	mut fp := flag.new_flag_parser(os.args)
 	fp.application('vlang-socks')
 	fp.description('A minimal SOCKS4/4a/5 proxy server.')
