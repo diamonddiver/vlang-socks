@@ -98,3 +98,31 @@ fn test_encode_domain_roundtrip() {
 	back, _ := parse_addr(encode_addr(a))!
 	assert back == a
 }
+
+fn test_encode_ipv6_double_colon_compression() {
+	// 2001:db8::1 -> 2001:0db8:0000:0000:0000:0000:0000:0001. This exercises
+	// ipv6_to_bytes's `::`-expansion branch directly: parse_addr can never
+	// produce a host string containing '::' (ipv6_from_bytes's u16.hex()
+	// never emits an empty group), so this path is otherwise unreachable
+	// from the roundtrip tests above.
+	a := Addr{
+		atyp: .ipv6
+		host: '2001:db8::1'
+		port: 53
+	}
+	enc := encode_addr(a)
+	want := [u8(0x04), 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 53]
+	assert enc == want
+}
+
+fn test_encode_ipv6_all_compressed() {
+	// '::' alone expands to all 16 zero bytes (head and tail both empty,
+	// so ipv6_to_bytes fills all 8 groups with '0').
+	a := Addr{
+		atyp: .ipv6
+		host: '::'
+		port: 0
+	}
+	enc := encode_addr(a)
+	assert enc == [u8(0x04), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
