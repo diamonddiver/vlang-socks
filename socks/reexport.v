@@ -46,6 +46,7 @@ pub mut:
 	resolve_mode     ResolveMode    = .server_side
 	versions         []SocksVersion = [.v4, .v4a, .v5]
 	resolver_threads int            = 8
+	log_connections  bool // default false; the CLI enables it
 }
 
 pub struct ClientConfig {

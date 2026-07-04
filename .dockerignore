@@ -2,5 +2,5 @@
 docs
 *.md
 /out
-**/vlang-socks
+cmd/vlang-socks/vlang-socks
 *.o

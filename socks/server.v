@@ -300,6 +300,11 @@ fn (mut s Server) apply(mut pv picoev.Picoev, mut r Relay, act core.Action) {
 		return
 	}
 	if t := act.connect {
+		if s.cfg.log_connections {
+			ver := if r.fam == .socks5 { 'socks5' } else { 'socks4' }
+			src := if a := r.client.peer_addr() { a.str() } else { '?' }
+			println('${ver} ${src} -> ${t.host}:${t.port}')
+		}
 		s.next_id++
 		r.conn_id = s.next_id
 		s.pending[r.conn_id] = r
