@@ -1,6 +1,7 @@
 module socks
 
 import net
+import time
 import socks.core
 import socks.socks5
 import socks.socks4
@@ -171,4 +172,75 @@ fn test_dial_socks4a() {
 	mut conn := dial(cfg, 'example.com:80')!
 	roundtrip(mut conn)!
 	conn.close()!
+}
+
+// test_dial_clears_handshake_deadline guards against a regression: dial()
+// sets client_timeout (30s) on the raw connection to bound the SOCKS
+// handshake, but must clear it again before handing the connection back to
+// the caller. Under the old blocking-socket build this deadline was inert,
+// so a leftover 30s timeout was silently harmless; under
+// -d net_nonblocking_sockets (see commit 22348c5) it is enforced for real,
+// and a caller idling on the returned connection for >30s (e.g. a
+// long-poll) would get a spurious timeout error that never happened
+// before. Assert directly on TcpConn's public read_timeout()/
+// write_timeout() getters, which read back the exact net.Duration dial()
+// leaves in place — this is fast (b)-style strong evidence per the task
+// brief, and it must be net.infinite_timeout specifically, not
+// net.no_timeout: see the long comment in dial() for why plain
+// net.no_timeout (Duration 0) does NOT actually mean "block forever" in
+// this vlib build (a first attempt at this fix used net.no_timeout and it
+// made every post-dial read fail in microseconds — the companion
+// behavioral test below is what caught it).
+fn test_dial_clears_handshake_deadline() {
+	mut l, addr := spawn_fake_proxy(handle_s5_noauth) or { panic(err) }
+	defer {
+		l.close() or {}
+	}
+	mut conn := dial(ClientConfig{ proxy_addr: addr }, '1.2.3.4:80')!
+	defer {
+		conn.close() or {}
+	}
+	assert conn.read_timeout() == net.infinite_timeout
+	assert conn.write_timeout() == net.infinite_timeout
+}
+
+// test_dial_returned_conn_survives_short_idle is a behavioral companion to
+// test_dial_clears_handshake_deadline: it does not merely inspect the
+// timeout field, it actually idles on the returned connection past the
+// point where a broken "clear" (e.g. net.no_timeout, which was tried and
+// silently produced an immediate `net: op timed out` — see dial()'s
+// comment) would already have failed. The fake proxy waits well past the
+// handshake before writing anything on the tunnel; a correct fix blocks
+// until then, a broken one errors out almost instantly.
+fn test_dial_returned_conn_survives_short_idle() {
+	idle_delay := 300 * time.millisecond
+	handler := fn [idle_delay] (mut c net.TcpConn) {
+		mut h := []u8{len: 2}
+		c.read(mut h) or { return }
+		mut methods := []u8{len: int(h[1])}
+		c.read(mut methods) or { return }
+		c.write(socks5.encode_method_select(socks5.method_no_auth)) or { return }
+		mut req := []u8{len: 10}
+		c.read(mut req) or { return }
+		c.write(socks5.encode_reply(core.rep_success, socks5.Addr{
+			atyp: .ipv4
+			host: '0.0.0.0'
+			port: 0
+		})) or { return }
+		// Handshake is done; idle past it before the tunnel carries data,
+		// exactly like a long-poll caller would idle on the returned conn.
+		time.sleep(idle_delay)
+		c.write('late'.bytes()) or {}
+	}
+	mut l, addr := spawn_fake_proxy(handler) or { panic(err) }
+	defer {
+		l.close() or {}
+	}
+	mut conn := dial(ClientConfig{ proxy_addr: addr }, '1.2.3.4:80')!
+	defer {
+		conn.close() or {}
+	}
+	mut b := []u8{len: 16}
+	n := conn.read(mut b)!
+	assert b[..n] == 'late'.bytes()
 }

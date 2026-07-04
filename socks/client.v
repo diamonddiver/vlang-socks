@@ -29,6 +29,29 @@ pub fn dial(cfg ClientConfig, target_addr string) !net.TcpConn {
 			}
 		}
 	}
+	// The 30s client_timeout above only bounds the handshake itself. The
+	// caller receives this connection as a plain data tunnel and may
+	// legitimately idle on it far longer (long-poll, keep-alive, etc.), so
+	// the deadline must not survive past this point.
+	//
+	// Deliberately net.infinite_timeout, NOT net.no_timeout: net.no_timeout
+	// is Duration(0), which in vlib/net's wait_for_common falls back to
+	// TcpConn's read_deadline/write_deadline time.Time fields. Those default
+	// to the zero-valued time.Time{} — NOT the same instant as time.unix(0)
+	// — because Time.unix() lazily recomputes from the (year:0, month:0,
+	// day:0, ...) calendar fields via mktime when its private `unix` field
+	// is itself still 0, yielding a huge negative timestamp (verified: -62169984000, i.e. deep in year 0) instead of 0. select_deadline's
+	// `deadline.unix() == 0` "is this infinite?" check then reads false, and
+	// the connection is treated as already past its deadline: every read
+	// times out in microseconds instead of blocking (reproduced directly
+	// against this vlib build; confirmed with -d net_nonblocking_sockets).
+	// net.infinite_timeout instead hits wait_for_common's dedicated
+	// `timeout == infinite_timeout` branch, which sets real_deadline to a
+	// freshly constructed time.unix(0) (whose unix() does read back as 0),
+	// bypassing the broken zero-value deadline fields entirely and blocking
+	// for real.
+	conn.set_read_timeout(net.infinite_timeout)
+	conn.set_write_timeout(net.infinite_timeout)
 	return *conn
 }
 
