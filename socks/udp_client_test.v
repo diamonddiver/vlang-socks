@@ -90,21 +90,26 @@ fn test_udp_associate_roundtrip() {
 
 // test_udp_associate_wildcard_relay_host_falls_back_to_proxy specifically
 // exercises the branch in udp_associate that substitutes the proxy host
-// when the relay's UDP ASSOCIATE reply advertises 0.0.0.0. The relay here
-// still really binds to 127.0.0.1 (so the round trip can succeed at all),
-// but reports 0.0.0.0 in the reply; proxy_addr is 127.0.0.1:<port>, so the
-// client must fall back to 127.0.0.1 to dial the actual relay socket. If the
-// fallback logic were broken (e.g. dialing 0.0.0.0 literally, or using the
-// wrong host), the round trip below would fail or time out.
+// when the relay's UDP ASSOCIATE reply advertises 0.0.0.0. The control
+// listener (and the relay's real UDP socket) bind to 127.0.0.2 rather than
+// 127.0.0.1: on Linux, sending a UDP packet to destination 0.0.0.0:<port> is
+// silently kernel-routed to 127.0.0.1:<port> specifically (verified
+// empirically; 127.0.0.2 does NOT receive it). Using 127.0.0.1 here would
+// let the test pass even if the fallback logic in udp_client.v were deleted
+// entirely, since the client's dial of the literal 0.0.0.0 address would
+// still reach a relay bound on 127.0.0.1 by kernel accident. With 127.0.0.2,
+// only a client that actually substitutes the proxy host (per
+// cfg.proxy_addr) will dial the right address and complete the round trip;
+// a client that dials 0.0.0.0 literally will time out / error instead.
 fn test_udp_associate_wildcard_relay_host_falls_back_to_proxy() {
-	mut l := net.listen_tcp(.ip, '127.0.0.1:0') or { panic(err) }
+	mut l := net.listen_tcp(.ip, '127.0.0.2:0') or { panic(err) }
 	addr := l.addr() or { panic(err) }.str()
 	defer {
 		l.close() or {}
 	}
 	spawn fn (mut l net.TcpListener) {
 		mut c := l.accept() or { return }
-		fake_udp_relay_wildcard(mut c, '127.0.0.1')
+		fake_udp_relay_wildcard(mut c, '127.0.0.2')
 	}(mut l)
 
 	mut sess := udp_associate(ClientConfig{ proxy_addr: addr })!
