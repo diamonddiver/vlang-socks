@@ -218,6 +218,15 @@ fn raw_cb(fd int, events int, context voidptr) {
 
 fn (mut s Server) on_accept(mut pv picoev.Picoev) {
 	mut c := s.listener.accept() or { return }
+	// Deliberately net.infinite_timeout, NOT net.no_timeout / the vlib default:
+	// see dial()'s doc comment in client.v for the full explanation of why
+	// net.no_timeout (Duration(0)) is a plausible-looking WRONG choice on this
+	// V version (a zero-valued time.Time{} quirk makes reads/writes fail in
+	// microseconds instead of blocking). Relay traffic is meant to be long-lived,
+	// so "block forever" must be an explicit, deliberate choice here too, not
+	// whatever a freshly-constructed TcpConn happens to default to.
+	c.set_read_timeout(net.infinite_timeout)
+	c.set_write_timeout(net.infinite_timeout)
 	fd := c.sock.handle
 	mut r := &Relay{
 		client:    c
@@ -347,7 +356,13 @@ fn (mut s Server) on_result(mut pv picoev.Picoev, res resolver.Result) {
 	}
 	s.pending.delete(res.id)
 	r.conn_id = 0
-	if tconn := res.conn {
+	if mut tconn := res.conn {
+		// Same deliberate "block forever" policy as on_accept's client conn
+		// above (and dial()'s tunnel conn in client.v) — an explicit,
+		// verified choice rather than whatever a freshly-connected TcpConn
+		// happens to default to.
+		tconn.set_read_timeout(net.infinite_timeout)
+		tconn.set_write_timeout(net.infinite_timeout)
 		r.target = tconn
 		r.target_fd = tconn.sock.handle
 		bound := socks5.Addr{

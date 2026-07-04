@@ -15,6 +15,12 @@ fn (mut s Server) start_udp(mut pv picoev.Picoev, mut r Relay) {
 		s.fail_relay(mut pv, mut r, .general_failure)
 		return
 	}
+	// Same deliberate "block forever" policy as the TCP client/target conns in
+	// server.v's on_accept/on_result (see those for the full net.infinite_timeout
+	// vs net.no_timeout rationale) — this relay socket's write_to calls should
+	// have an explicit, verified deadline policy rather than an accidental one.
+	u.set_read_timeout(net.infinite_timeout)
+	u.set_write_timeout(net.infinite_timeout)
 	// net.UdpConn has no `.addr()` (unlike TcpListener/TcpConn); the embedded
 	// Socket.address() reads the bound local address via getsockname() (same
 	// correction Task 19 applied in its fake_udp_relay test helper).
