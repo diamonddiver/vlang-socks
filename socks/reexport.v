@@ -65,6 +65,17 @@ pub mut:
 	// max_connections caps the number of concurrent accepted connections.
 	// <= 0 (default) means unlimited, matching the old behavior.
 	max_connections int
+	// idle_timeout bounds how long an established relay (post-handshake) may
+	// sit with no traffic in either direction before being closed. <= 0
+	// (default) disables the check: established relay traffic idles forever,
+	// the old behavior.
+	idle_timeout time.Duration
+	// connect_timeout bounds how long a single resolver worker may block
+	// dialing a target. Once it elapses the worker slot is freed (the
+	// connection fails with .local_timeout) even though the underlying OS
+	// dial is not cancelled. <= 0 disables the bound, preserving the old
+	// unbounded-dial behavior.
+	connect_timeout time.Duration = 30 * time.second
 }
 
 pub struct ClientConfig {

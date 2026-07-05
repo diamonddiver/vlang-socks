@@ -9,44 +9,47 @@ arbitrary internet clients.
 
 ## Resource-exhaustion / stall risks
 
-- **No per-connection handshake/idle timeout.** A client that connects and
-  never completes (or never finishes) the SOCKS handshake holds its fd and
-  `Relay` state indefinitely — until it disconnects on its own or the server
-  is stopped. There is no server-side timer to reclaim it. A hostile client
-  can hold many connections open this way to exhaust fds.
+- **Handshake timeout and connection cap are enforced; idle relays are not by
+  default.** An accepted connection that never finishes its SOCKS handshake is
+  reclaimed after `ServerConfig.handshake_timeout` (default 30s), and the total
+  number of concurrent accepted connections is bounded by
+  `ServerConfig.max_connections` (default 0 = unlimited). Once a connection is
+  **relaying**, however, it is only reclaimed for inactivity if
+  `ServerConfig.idle_timeout` is set (default 0 = disabled): with the default, an
+  established relay that goes silent holds its fds and `Relay` state until a peer
+  disconnects. Set `idle_timeout` when exposing the server to untrusted clients.
 
-- **No per-job connect timeout in the resolver pool.** `resolver.Pool` runs a
-  fixed number of worker threads (`ServerConfig.resolver_threads`, default 8)
-  that perform blocking DNS resolution + `net.dial_tcp()` for each `CONNECT`
-  request, and hands work to them through a bounded job queue (capacity 256).
-  If enough concurrent requests target slow or unreachable hosts, all workers
-  can end up blocked in-flight with no timeout to unstick them, and the job
-  queue backs up. This no longer stalls the event loop, though: `apply()`
-  hands jobs to the pool via `Pool.try_submit()`, which fails fast (replying
-  with a SOCKS failure) instead of blocking when the queue is full, so a
-  saturated pool degrades only new `CONNECT` requests, not every other
-  connection sharing the event loop. Connections already past this point are
-  unaffected either way — there is still no way to unstick an already-blocked
-  worker.
+- **Per-connect timeout bounds worker occupancy, not the underlying OS thread.**
+  The resolver pool (`ServerConfig.resolver_threads`, default 8) performs
+  blocking DNS + `net.dial_tcp()` off the event loop, fed by a bounded job queue
+  (capacity 256) that fails fast via `try_submit()` rather than blocking the loop
+  when full. Each dial is now bounded by `ServerConfig.connect_timeout` (default
+  30s, `<= 0` disables): on expiry the worker slot is freed immediately
+  (reporting `.local_timeout`) so a slow/unreachable target no longer pins a
+  worker for the OS's full connect timeout. vlib exposes no way to cancel a
+  blocked `getaddrinfo()`/`connect()`, so the abandoned dial's OS thread keeps
+  running in the background until the kernel gives up (any late-succeeding
+  connection is closed so its fd is not leaked). Under sustained abuse against
+  black-holed targets, background threads can therefore still accumulate faster
+  than they retire, even though the pool itself keeps accepting new jobs.
 
-- **Relay writes have no finite deadline.** Once a connection is relaying,
-  both the client-side and target-side sockets are deliberately given an
-  explicit "block forever" read/write deadline (`net.infinite_timeout` —
-  chosen over V's default deadline behavior, which has been observed to be an
-  unintentional artifact rather than a deliberate choice on this V version;
-  see the comments in `socks/client.v`'s `dial()` and `socks/server.v`'s
-  `on_accept`/`on_result` for the full explanation). This makes "block
-  forever" an intentional, verified choice instead of an accidental one, but
-  it does **not** add a finite timeout: a sufficiently slow or malicious peer
-  on either side of a relay can still hold that connection's socket (and the
-  event-loop thread's write) open indefinitely, since nothing forces it
-  closed.
+- **Relay writes are non-blocking with backpressure; no single peer stalls the
+  loop.** Relay data is written with a non-blocking send; whatever the kernel
+  cannot take immediately is queued per direction and drained on the next
+  writable event, and once a direction's outbound queue exceeds a high-water mark
+  (256 KiB) the opposite side's reads are paused until it drains. A slow or
+  malicious peer on either side therefore backs up only its own connection's
+  queue (bounded by that peer's own progress and, if set, `idle_timeout`) instead
+  of blocking the single event-loop thread for every other connection. The relay
+  sockets still carry `net.infinite_timeout` at the socket level, but that
+  deadline is no longer on any path that can block the loop.
 
-Taken together: this v1 is best suited for **trusted or low-hostility network
-environments** (e.g. a personal or internal proxy), not for exposing directly
-to arbitrary untrusted internet clients without additional hardening — for
-example a reverse proxy / connection-rate-limiter in front, or waiting for a
-future version that adds the timeouts described above.
+What remains for exposing this directly to arbitrary untrusted internet clients
+is out-of-scope-for-v1 **policy**, not the stall risks above: there is no egress
+filtering (SSRF to loopback/link-local/RFC1918/metadata targets), no per-source
+connection or rate limiting, and the UDP / `resolve_mode` gaps below. Enable
+`idle_timeout` and put a rate-limiter / egress policy in front before serving
+hostile traffic.
 
 ## Protocol / addressing limitations
 
@@ -86,13 +89,16 @@ future version that adds the timeouts described above.
   literals) gets silently ignored configuration. `ClientConfig.resolve_mode`
   is unaffected by this — it works as documented for `dial()`/`udp_associate()`.
 
-- **`SocksErrorCode.local_timeout` and `.internal_error` are never raised.**
-  Both are part of the public error taxonomy, but no code path in v1
-  constructs either variant. In particular, a client-side handshake read that
-  fails because of `dial()`'s own timeout deadline (rather than a malformed
-  reply from the proxy) is currently reported as `.protocol_error`, not
-  `.local_timeout` — callers cannot yet distinguish "the proxy is slow/hung"
-  from "the proxy sent bytes we couldn't parse" by matching on `err.kind`.
+- **`SocksErrorCode.local_timeout` and `.internal_error` are raised only on
+  specific paths.** Both are now produced: a client-side read that fails on
+  `dial()`'s deadline is reported as `.local_timeout` (not `.protocol_error`, so
+  callers can distinguish "the proxy is slow/hung" from "the proxy sent bytes we
+  couldn't parse"), a resolver dial that exceeds `connect_timeout` reports
+  `.local_timeout`, and an unclassifiable resolver failure reports
+  `.internal_error`. The remaining gap: server-side handshake reads on accepted
+  connections (the event loop's own `read_some`) do not distinguish a
+  read-deadline timeout — only the client `dial()`/`udp_associate()` paths and
+  the resolver do.
 
 ## Lifecycle
 
@@ -108,7 +114,12 @@ future version that adds the timeouts described above.
 
 None of the above are correctness bugs in the sense of violating the SOCKS
 protocol for well-behaved traffic — they are accepted v1 scope/hardening
-trade-offs. But viewed together they mean a single slow or hostile peer can
-degrade or stall service for every other connection sharing the same event
-loop. Treat this as a proxy for cooperative environments, not as a
-public-internet-facing service, until timeouts are added for the cases above.
+trade-offs. The worst of the earlier stall risks have been closed: a single slow
+or hostile peer can no longer freeze the event loop for every other connection
+(non-blocking relay writes + backpressure), unfinished handshakes and idle
+relays can be reaped (`handshake_timeout` / `idle_timeout`), the connection count
+is capped (`max_connections`), and stuck dials free their worker slot
+(`connect_timeout`). What remains for a public-internet deployment is
+out-of-scope-for-v1 policy — egress/SSRF filtering, per-source rate limiting, and
+the UDP / `resolve_mode` gaps above. Enable `idle_timeout` and front the server
+with a rate-limiter before exposing it to arbitrary untrusted clients.

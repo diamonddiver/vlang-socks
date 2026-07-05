@@ -1,5 +1,6 @@
 module socks
 
+import time
 import socks.core
 
 fn test_default_server_config() {
@@ -9,6 +10,8 @@ fn test_default_server_config() {
 	assert cfg.versions == [SocksVersion.v4, .v4a, .v5]
 	assert cfg.resolver_threads == 8
 	assert cfg.resolve_mode == .server_side
+	assert cfg.idle_timeout == 0
+	assert cfg.connect_timeout == 30 * time.second
 	match cfg.auth {
 		NoAuth {}
 		else { assert false }

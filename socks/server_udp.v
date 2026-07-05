@@ -1,6 +1,7 @@
 module socks
 
 import net
+import time
 import picoev
 import socks.socks5
 
@@ -15,12 +16,18 @@ fn (mut s Server) start_udp(mut pv picoev.Picoev, mut r Relay) {
 		s.fail_relay(mut pv, mut r, .general_failure)
 		return
 	}
-	// Same deliberate "block forever" policy as the TCP client/target conns in
-	// server.v's on_accept/on_result (see those for the full net.infinite_timeout
-	// vs net.no_timeout rationale) — this relay socket's write_to calls should
-	// have an explicit, verified deadline policy rather than an accidental one.
+	// Same deliberate "block forever" read policy as the TCP client/target
+	// conns in server.v's on_accept/on_result (see those for the full
+	// net.infinite_timeout vs net.no_timeout rationale).
 	u.set_read_timeout(net.infinite_timeout)
-	u.set_write_timeout(net.infinite_timeout)
+	// The write side is deliberately the OPPOSITE choice: net.no_timeout
+	// makes a write_to call whose send buffer is full fail in microseconds
+	// (the same vlib zero-deadline quirk documented on dial() in client.v)
+	// instead of blocking the picoev loop. Datagrams here are already
+	// best-effort/droppable (every write_to call below is wrapped in `or
+	// {}`), so failing fast and dropping one is strictly better than
+	// stalling every other connection on a full UDP send buffer.
+	u.set_write_timeout(net.no_timeout)
 	// net.UdpConn has no `.addr()` (unlike TcpListener/TcpConn); the embedded
 	// Socket.address() reads the bound local address via getsockname() (same
 	// correction Task 19 applied in its fake_udp_relay test helper).
@@ -39,6 +46,7 @@ fn (mut s Server) start_udp(mut pv picoev.Picoev, mut r Relay) {
 		return
 	}
 	r.relaying = true
+	r.last_activity = time.now()
 	s.relays[r.udp_fd] = r
 	s.roles[r.udp_fd] = .udp
 	pv_add(mut pv, r.udp_fd)
@@ -49,6 +57,7 @@ fn (mut s Server) on_udp_readable(mut pv picoev.Picoev, fd int) {
 	mut r := s.relays[fd] or { return }
 	mut buf := []u8{len: 65535}
 	n, peer := r.udp.read(mut buf) or { return }
+	r.last_activity = time.now()
 	peer_str := peer.str()
 	// The first datagram claiming to be the client is only trusted if its source
 	// IP matches the TCP control connection's peer IP (RFC 1928 client-binding).
