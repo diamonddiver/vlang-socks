@@ -120,9 +120,101 @@ fn test_udp_associate_wildcard_relay_host_falls_back_to_proxy() {
 	sess.close()
 }
 
+// test_udp_associate_sets_infinite_timeout guards against a regression: the
+// client-side UDP socket used to be left at vlib's short default read/write
+// timeout, causing read_from() to spuriously time out on any round trip
+// slower than that default — the same class of bug already fixed for the TCP
+// tunnel in client.v's dial() and for the server-side sockets in server.v/
+// server_udp.v.
+fn test_udp_associate_sets_infinite_timeout() {
+	mut l := net.listen_tcp(.ip, '127.0.0.1:0') or { panic(err) }
+	addr := l.addr() or { panic(err) }.str()
+	defer {
+		l.close() or {}
+	}
+	spawn fn (mut l net.TcpListener) {
+		mut c := l.accept() or { return }
+		fake_udp_relay(mut c, '127.0.0.1')
+	}(mut l)
+
+	mut sess := udp_associate(ClientConfig{ proxy_addr: addr })!
+	defer {
+		sess.close()
+	}
+	assert sess.udp.read_timeout() == net.infinite_timeout
+	assert sess.udp.write_timeout() == net.infinite_timeout
+}
+
+// test_udp_associate_honors_resolve_mode guards against a regression:
+// write_to() used to hardcode ResolveMode.server_side regardless of what the
+// caller configured, silently discarding cfg.resolve_mode once the session
+// was built.
+fn test_udp_associate_honors_resolve_mode() {
+	mut l := net.listen_tcp(.ip, '127.0.0.1:0') or { panic(err) }
+	addr := l.addr() or { panic(err) }.str()
+	defer {
+		l.close() or {}
+	}
+	spawn fn (mut l net.TcpListener) {
+		mut c := l.accept() or { return }
+		fake_udp_relay(mut c, '127.0.0.1')
+	}(mut l)
+
+	mut sess := udp_associate(ClientConfig{ proxy_addr: addr, resolve_mode: .client_side })!
+	defer {
+		sess.close()
+	}
+	assert sess.resolve_mode == .client_side
+}
+
 fn test_udp_associate_requires_v5() {
 	udp_associate(ClientConfig{ proxy_addr: '127.0.0.1:1', version: .v4 }) or {
 		assert err.msg().contains('SOCKS5')
+		return
+	}
+	assert false
+}
+
+// fake_proxy_userpass_select: a minimal SOCKS5 proxy stub that only performs
+// method negotiation (selecting user/pass auth) and then blocks, waiting for
+// the control connection to close. Local to this file because
+// client_test.v's spawn_fake_proxy/handle_s5_userpass helpers are not
+// visible here: `v test` compiles each _test.v file as its own program
+// alongside the module's non-test sources, not alongside sibling _test.v
+// files.
+fn fake_proxy_userpass_select(mut c net.TcpConn) {
+	mut h := []u8{len: 2}
+	c.read(mut h) or { return }
+	mut methods := []u8{len: int(h[1])}
+	c.read(mut methods) or { return }
+	c.write(socks5.encode_method_select(socks5.method_user_pass)) or { return }
+	mut sink := []u8{len: 1}
+	c.read(mut sink) or {}
+}
+
+// test_udp_associate_rejects_oversized_username guards against a regression:
+// socks5_client_auth's inlined userpass-length check (a separate copy of the
+// same logic dial5 has) must reject a >255-byte credential before ever
+// reaching the wire.
+fn test_udp_associate_rejects_oversized_username() {
+	mut l := net.listen_tcp(.ip, '127.0.0.1:0') or { panic(err) }
+	addr := l.addr() or { panic(err) }.str()
+	defer {
+		l.close() or {}
+	}
+	spawn fn (mut l net.TcpListener) {
+		mut c := l.accept() or { return }
+		fake_proxy_userpass_select(mut c)
+	}(mut l)
+	long_user := 'u'.repeat(256)
+	cfg := ClientConfig{
+		proxy_addr: addr
+		version:    .v5
+		auth:       user_pass_auth(long_user, 'p')
+	}
+	udp_associate(cfg) or {
+		assert (err as core.SocksError).kind == .protocol_error
+		assert err.msg().contains('255')
 		return
 	}
 	assert false

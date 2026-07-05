@@ -69,6 +69,9 @@ fn dial5(mut conn net.TcpConn, cfg ClientConfig, host string, port u16) ! {
 	}
 	if sel == socks5.method_user_pass {
 		up := cfg.auth as UserPassAuth
+		if up.user.len > 255 || up.pass.len > 255 {
+			return core.err(.protocol_error, 'socks: username/password must each be 255 bytes or fewer')
+		}
 		conn.write(socks5.encode_userpass(socks5.UserPass{ user: up.user, pass: up.pass }))!
 		ok := socks5.parse_userpass_reply(read_exact(mut conn, 2)!)!
 		if !ok {
@@ -126,6 +129,13 @@ fn make_addr5(host string, port u16, mode ResolveMode) !socks5.Addr {
 		}
 	}
 	if host.contains(':') {
+		// A ':' means IPv6 syntax was intended; reject outright rather than
+		// falling through to encode it as a malformed literal or a "domain"
+		// (domain names cannot contain ':') — encode_addr's ipv6 arm has no
+		// validation of its own and would otherwise silently truncate/corrupt.
+		if !is_ipv6(host) {
+			return core.err(.protocol_error, 'socks: malformed IPv6 address ${host}')
+		}
 		return socks5.Addr{
 			atyp: .ipv6
 			host: host
@@ -139,6 +149,12 @@ fn make_addr5(host string, port u16, mode ResolveMode) !socks5.Addr {
 			host: ip
 			port: port
 		}
+	}
+	if host.len > 255 {
+		// encode_addr's domain arm casts the byte length to u8; anything over
+		// 255 bytes would silently wrap and corrupt the wire frame instead of
+		// erroring.
+		return core.err(.protocol_error, 'socks: domain name too long (${host.len} bytes, max 255): ${host}')
 	}
 	return socks5.Addr{
 		atyp: .domain
@@ -221,6 +237,45 @@ fn is_ipv4(s string) bool {
 		}
 		if p.int() > 255 {
 			return false
+		}
+	}
+	return true
+}
+
+// is_ipv6 validates a colon-containing host as a plausible IPv6 literal (full
+// 8-group form, one '::' abbreviation, or the bare '::' all-zero form), to
+// the same fidelity addr.v's ipv6_to_bytes/groups_to_bytes assume — it
+// doesn't need full RFC 4291 coverage, just to reject shapes that would
+// otherwise silently corrupt.
+fn is_ipv6(s string) bool {
+	dc_parts := s.split('::')
+	if dc_parts.len > 2 {
+		return false // more than one '::' is invalid
+	}
+	mut groups := []string{}
+	if dc_parts.len == 2 {
+		head := if dc_parts[0] == '' { []string{} } else { dc_parts[0].split(':') }
+		tail := if dc_parts[1] == '' { []string{} } else { dc_parts[1].split(':') }
+		if head.len + tail.len > 7 {
+			return false // '::' must represent at least one omitted group
+		}
+		groups << head
+		groups << tail
+	} else {
+		groups = s.split(':')
+		if groups.len != 8 {
+			return false
+		}
+	}
+	for g in groups {
+		if g.len == 0 || g.len > 4 {
+			return false
+		}
+		for c in g {
+			is_hex := (c >= `0` && c <= `9`) || (c >= `a` && c <= `f`) || (c >= `A` && c <= `F`)
+			if !is_hex {
+				return false
+			}
 		}
 	}
 	return true

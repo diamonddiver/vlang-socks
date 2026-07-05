@@ -6,9 +6,10 @@ import socks.socks5
 
 pub struct UdpSession {
 mut:
-	control    &net.TcpConn = unsafe { nil }
-	udp        &net.UdpConn = unsafe { nil }
-	relay_addr string
+	control      &net.TcpConn = unsafe { nil }
+	udp          &net.UdpConn = unsafe { nil }
+	relay_addr   string
+	resolve_mode ResolveMode
 }
 
 // udp_associate opens a SOCKS5 UDP association and returns a session whose
@@ -54,16 +55,25 @@ pub fn udp_associate(cfg ClientConfig) !UdpSession {
 		conn.close() or {}
 		return err
 	}
+	// Same deliberate "block forever" policy as every other long-lived socket
+	// this library hands back to a caller (see dial()'s doc comment in
+	// client.v for the full net.infinite_timeout vs net.no_timeout rationale).
+	// Without this, vlib's default UDP read/write timeout applies, and
+	// read_from()/write_to() would spuriously time out on any round trip
+	// slower than that default.
+	u.set_read_timeout(net.infinite_timeout)
+	u.set_write_timeout(net.infinite_timeout)
 	return UdpSession{
-		control:    conn
-		udp:        u
-		relay_addr: relay
+		control:      conn
+		udp:          u
+		relay_addr:   relay
+		resolve_mode: cfg.resolve_mode
 	}
 }
 
 pub fn (mut s UdpSession) write_to(addr string, data []u8) ! {
 	host, port := split_host_port(addr)!
-	a := make_addr5(host, port, .server_side)!
+	a := make_addr5(host, port, s.resolve_mode)!
 	s.udp.write(socks5.encode_udp_datagram(a, data))!
 }
 
@@ -98,6 +108,9 @@ fn socks5_client_auth(mut conn net.TcpConn, cfg ClientConfig) ! {
 	}
 	if sel == socks5.method_user_pass {
 		up := cfg.auth as UserPassAuth
+		if up.user.len > 255 || up.pass.len > 255 {
+			return core.err(.protocol_error, 'socks: username/password must each be 255 bytes or fewer')
+		}
 		conn.write(socks5.encode_userpass(socks5.UserPass{ user: up.user, pass: up.pass }))!
 		ok := socks5.parse_userpass_reply(read_exact(mut conn, 2)!)!
 		if !ok {

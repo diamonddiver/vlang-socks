@@ -134,6 +134,29 @@ fn test_dial_socks5_userpass_rejected() {
 	assert false
 }
 
+// test_dial_socks5_rejects_oversized_username guards against a regression:
+// encode_userpass casts the username/password byte length to u8 with no
+// bounds check, so a >255-byte credential silently wrapped and corrupted the
+// RFC 1929 sub-negotiation frame instead of erroring before ever reaching the
+// wire.
+fn test_dial_socks5_rejects_oversized_username() {
+	mut l, addr := spawn_fake_proxy(handle_s5_userpass(true)) or { panic(err) }
+	defer {
+		l.close() or {}
+	}
+	long_user := 'u'.repeat(256)
+	cfg := ClientConfig{
+		proxy_addr: addr
+		auth:       user_pass_auth(long_user, 'p')
+	}
+	dial(cfg, '1.2.3.4:80') or {
+		assert (err as core.SocksError).kind == .protocol_error
+		assert err.msg().contains('255')
+		return
+	}
+	assert false
+}
+
 fn test_dial_socks5_failure_maps_code() {
 	mut l, addr := spawn_fake_proxy(handle_s5_fail) or { panic(err) }
 	defer {
@@ -243,4 +266,67 @@ fn test_dial_returned_conn_survives_short_idle() {
 	mut b := []u8{len: 16}
 	n := conn.read(mut b)!
 	assert b[..n] == 'late'.bytes()
+}
+
+// test_make_addr5_rejects_oversized_domain guards against a regression:
+// encode_addr's domain arm casts the byte length to u8 with no bounds check,
+// so a >255-byte domain name silently wrapped and corrupted the wire frame
+// instead of erroring before ever reaching the wire.
+fn test_make_addr5_rejects_oversized_domain() {
+	long_host := 'a'.repeat(256)
+	make_addr5(long_host, 80, .server_side) or {
+		assert (err as core.SocksError).kind == .protocol_error
+		assert err.msg().contains('too long')
+		return
+	}
+	assert false
+}
+
+fn test_make_addr5_accepts_domain_at_limit() {
+	host := 'a'.repeat(255)
+	addr := make_addr5(host, 80, .server_side)!
+	assert addr.atyp == .domain
+	assert addr.host == host
+}
+
+// test_make_addr5_rejects_malformed_ipv6 guards against a regression: any
+// host containing ':' used to be encoded as .ipv6 unconditionally, and
+// encode_addr's ipv6 arm silently truncates/corrupts malformed literals
+// instead of erroring.
+fn test_make_addr5_rejects_malformed_ipv6() {
+	make_addr5('1:2:3', 80, .server_side) or {
+		assert (err as core.SocksError).kind == .protocol_error
+		assert err.msg().contains('malformed')
+		return
+	}
+	assert false
+}
+
+fn test_make_addr5_accepts_valid_ipv6() {
+	full := make_addr5('2001:db8:0:0:0:0:0:1', 80, .server_side)!
+	assert full.atyp == .ipv6
+	compressed := make_addr5('2001:db8::1', 80, .server_side)!
+	assert compressed.atyp == .ipv6
+	loopback := make_addr5('::1', 80, .server_side)!
+	assert loopback.atyp == .ipv6
+}
+
+// test_make_addr5_accepts_bare_double_colon guards against a regression: the
+// bare '::' literal (RFC 4291's all-zero address, 0:0:0:0:0:0:0:0) must be
+// accepted, not rejected as malformed.
+fn test_make_addr5_accepts_bare_double_colon() {
+	addr := make_addr5('::', 80, .server_side)!
+	assert addr.atyp == .ipv6
+}
+
+// test_make_addr5_rejects_embedded_ipv4_form documents current, intentionally
+// narrower-than-RFC-4291 behavior: is_ipv6 only accepts pure hex-group IPv6
+// literals, not embedded-IPv4 forms like '::ffff:1.2.3.4'. This is
+// coverage-only; that behavior should not change.
+fn test_make_addr5_rejects_embedded_ipv4_form() {
+	make_addr5('::ffff:1.2.3.4', 80, .server_side) or {
+		assert err.msg().contains('malformed')
+		return
+	}
+	assert false
 }
