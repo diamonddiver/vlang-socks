@@ -24,7 +24,12 @@ else
   IMAGE_DEP :=
 endif
 
-.PHONY: image test test-all vet fmt build run shell clean lib lib-all all
+.PHONY: help image test test-all vet fmt build run shell clean lib lib-all all
+
+.DEFAULT_GOAL := help
+
+help:               ## Show this help
+	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
 
 # -d net_nonblocking_sockets: required so UDP (and TCP) read timeouts/deadlines
 # actually take effect at runtime instead of silently no-op'ing — see the
