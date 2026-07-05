@@ -70,3 +70,21 @@ fn test_resolver_reports_failure() {
 	e := r.err or { panic('expected an error') }
 	assert e.kind in [core.SocksErrorCode.connection_refused, .host_unreachable, .general_failure]
 }
+
+fn test_try_submit_reports_false_when_queue_full() {
+	// No workers spawned (constructed directly, not via new()), so nothing
+	// drains `jobs` — the queue stays exactly as full as we leave it.
+	mut p := Pool{
+		jobs:    chan Job{cap: 1}
+		results: chan Result{cap: 1}
+	}
+	job := Job{
+		id:     1
+		target: core.Target{
+			host: '10.0.0.1'
+			port: 80
+		}
+	}
+	assert p.try_submit(job) == true // fills the cap-1 queue
+	assert p.try_submit(job) == false // queue full: must return immediately, not block
+}

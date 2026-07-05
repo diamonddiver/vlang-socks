@@ -37,7 +37,6 @@ mut:
 	// UDP association fields (SOCKS5 UDP ASSOCIATE)
 	udp        &net.UdpConn = unsafe { nil }
 	udp_fd     int          = -1
-	is_udp     bool
 	client_udp string
 }
 
@@ -103,20 +102,37 @@ pub fn spawn_serve(cfg ServerConfig) !ServerHandle {
 	mut l := net.listen_tcp(.ip, cfg.addr) or {
 		return error('socks: cannot bind ${cfg.addr}: ${err.msg()}')
 	}
-	bound := l.addr()!.str()
+	addr := l.addr() or {
+		l.close() or {}
+		return err
+	}
+	bound := addr.str()
 	// notify socket pair over loopback.
-	np_r, np_w := make_notify_pair()!
+	mut np_r, mut np_w := make_notify_pair() or {
+		l.close() or {}
+		return err
+	}
+	mut pool := resolver.new(cfg.resolver_threads)
 	mut srv := &Server{
 		cfg:         cfg
 		bound_addr:  bound
 		listener:    l
-		pool:        resolver.new(cfg.resolver_threads)
+		pool:        pool
 		notify_r:    np_r
 		notify_w:    np_w
 		reaper_stop: chan bool{cap: 1}
 	}
 	srv.notify_fd = np_r.sock.handle
-	srv.start()!
+	srv.start() or {
+		// pool.close() is safe here (unlike in request_stop()/shutdown()): the
+		// loop thread that would ever call pool.submit() has not been spawned
+		// yet, since start() failed before reaching that point.
+		l.close() or {}
+		np_r.close() or {}
+		np_w.close() or {}
+		pool.close()
+		return err
+	}
 	return ServerHandle{
 		srv: srv
 	}
@@ -315,12 +331,17 @@ fn (mut s Server) apply(mut pv picoev.Picoev, mut r Relay, act core.Action) {
 			println('${ver} ${src} -> ${t.host}:${t.port}')
 		}
 		s.next_id++
-		r.conn_id = s.next_id
-		s.pending[r.conn_id] = r
-		s.pool.submit(resolver.Job{
-			id:     r.conn_id
-			target: t
-		})
+		id := s.next_id
+		if !s.pool.try_submit(resolver.Job{ id: id, target: t }) {
+			// All resolver workers are stuck and the job queue is full: fail
+			// this connection fast instead of blocking submit(), which would
+			// stall the entire event loop (every other connection) until a
+			// worker frees up.
+			s.fail_relay(mut pv, mut r, .general_failure)
+			return
+		}
+		r.conn_id = id
+		s.pending[id] = r
 	}
 }
 
@@ -476,6 +497,13 @@ fn (mut s Server) shutdown(mut pv picoev.Picoev) {
 		mut r := s.relays[fd] or { continue }
 		s.close_relay(mut pv, mut r)
 	}
+	// The notify pair is Server-owned and, unlike every relay fd, had no other
+	// cleanup path: request_stop() (external thread) only closes s.listener,
+	// so without this, both ends leaked 2 fds on every spawn_serve/stop cycle.
+	pv_del(mut pv, s.notify_fd)
+	s.roles.delete(s.notify_fd)
+	s.notify_r.close() or {}
+	s.notify_w.close() or {}
 	// Shut the resolver pool down here — on the loop thread, the ONLY thread that
 	// ever calls submit() — so pool.close() can never race a concurrent submit().
 	s.pool.close()

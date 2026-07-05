@@ -20,10 +20,14 @@ arbitrary internet clients.
   that perform blocking DNS resolution + `net.dial_tcp()` for each `CONNECT`
   request, and hands work to them through a bounded job queue (capacity 256).
   If enough concurrent requests target slow or unreachable hosts, all workers
-  can end up blocked in-flight with no timeout to unstick them; once that
-  happens the job queue backs up, and `Pool.submit()` — called synchronously
-  from the event-loop thread — blocks trying to enqueue the next job. That
-  stalls the *entire* event loop (all connections, not just the slow one).
+  can end up blocked in-flight with no timeout to unstick them, and the job
+  queue backs up. This no longer stalls the event loop, though: `apply()`
+  hands jobs to the pool via `Pool.try_submit()`, which fails fast (replying
+  with a SOCKS failure) instead of blocking when the queue is full, so a
+  saturated pool degrades only new `CONNECT` requests, not every other
+  connection sharing the event loop. Connections already past this point are
+  unaffected either way — there is still no way to unstick an already-blocked
+  worker.
 
 - **Relay writes have no finite deadline.** Once a connection is relaying,
   both the client-side and target-side sockets are deliberately given an

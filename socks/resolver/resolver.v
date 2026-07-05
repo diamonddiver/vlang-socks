@@ -52,6 +52,25 @@ pub fn (mut p Pool) submit(job Job) {
 	p.jobs <- job
 }
 
+// try_submit is submit()'s non-blocking counterpart: it enqueues job and
+// returns true, or returns false immediately (instead of blocking) if the
+// queue is full — e.g. because every worker is stuck on a slow/unreachable
+// target. Callers on the event-loop thread must use this, not submit(): a
+// blocked submit() there stalls every connection, not just the slow one.
+// Same close() precondition as submit() applies.
+pub fn (mut p Pool) try_submit(job Job) bool {
+	mut sent := false
+	select {
+		p.jobs <- job {
+			sent = true
+		}
+		else {
+			sent = false
+		}
+	}
+	return sent
+}
+
 // close shuts down the jobs channel, signalling workers to exit once they
 // drain any already-queued jobs.
 //
@@ -60,6 +79,16 @@ pub fn (mut p Pool) submit(job Job) {
 // will panic on the closed channel.
 pub fn (mut p Pool) close() {
 	p.jobs.close()
+}
+
+// new_for_test builds a pool with a bounded job queue and NO workers draining
+// it, for deterministic tests of queue-full behavior (try_submit()). Do not
+// use in production: with no workers, submitted jobs never complete.
+pub fn new_for_test(queue_cap int) Pool {
+	return Pool{
+		jobs:    chan Job{cap: queue_cap}
+		results: chan Result{cap: queue_cap}
+	}
 }
 
 fn worker(jobs chan Job, results chan Result) {
