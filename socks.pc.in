@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: socks
+Description: SOCKS4/4a/5 client and server library (C ABI)
+Version: @VERSION@
+Libs: -L${libdir} -lsocks
+Libs.private: -lpthread
+Cflags: -I${includedir}

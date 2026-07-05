@@ -24,7 +24,7 @@ else
   IMAGE_DEP :=
 endif
 
-.PHONY: help image test test-all vet fmt build run shell clean lib lib-all all
+.PHONY: help image test test-all test-capi vet fmt build run shell clean lib lib-all all install
 
 .DEFAULT_GOAL := help
 
@@ -58,6 +58,11 @@ else
 endif
 MODPATH := -path @vlib:$(MODLINK_DIR)
 
+# Library version, parsed from v.mod's `version: '...'` (single source of
+# truth) — drives the SONAME/versioned-filename chain build-lib.sh produces
+# and the pkg-config file `install` generates.
+VERSION := $(shell sed -n "s/^[[:space:]]*version: *'\([^']*\)'.*/\1/p" v.mod)
+
 image:            ## Build the pinned dev toolchain image (cached after first run)
 	sudo docker build --target dev -t $(IMAGE) .
 
@@ -65,7 +70,15 @@ test: $(IMAGE_DEP)       ## Test one module:  make test MODULE=socks5  (DOCKER=0
 	$(RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && v $(VFLAGS) $(MODPATH) test $(MODULE)'
 
 test-all: $(IMAGE_DEP)   ## Test every module  (DOCKER=0 for host v)
-	$(RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && v $(VFLAGS) $(MODPATH) test core && v $(VFLAGS) $(MODPATH) test socks5 && v $(VFLAGS) $(MODPATH) test socks4 && v $(VFLAGS) $(MODPATH) test resolver && v $(VFLAGS) $(MODPATH) test . && v $(VFLAGS) $(MODPATH) test cmd/vlang-socks'
+	$(RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && v $(VFLAGS) $(MODPATH) test core && v $(VFLAGS) $(MODPATH) test socks5 && v $(VFLAGS) $(MODPATH) test socks4 && v $(VFLAGS) $(MODPATH) test resolver && v $(VFLAGS) -enable-globals $(MODPATH) test . && v $(VFLAGS) $(MODPATH) test cmd/vlang-socks'
+
+# `v test .`'s directory walk (used by test-all above) has no way to exclude
+# a named subdirectory, so it always descends into capi/ too — hence -enable-
+# globals on that one invocation, harmless for every other module (the flag
+# only unlocks syntax, it doesn't change codegen for code that isn't using
+# it). This target exists in addition so `capi` can be tested on its own.
+test-capi: $(IMAGE_DEP)  ## Test the capi module (needs -enable-globals)  (DOCKER=0 for host v)
+	$(RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && v $(VFLAGS) -enable-globals $(MODPATH) test capi'
 
 vet: $(IMAGE_DEP)        ## What CI checks: fmt-verify + vet  (DOCKER=0 for host v)
 	$(RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && v fmt -verify . cmd && v $(MODPATH) vet .'
@@ -81,13 +94,28 @@ else
   LIB_RUN :=
 endif
 
+# -enable-globals: the lib is built from the `capi` module (which pulls in
+# `socks` transitively), not from `.` — capi's handle registry needs it, but
+# plain V consumers doing `import socks` never link capi and never need it.
 lib: $(IMAGE_DEP)        ## Build shared (.so) + static (.a) + module-cache object for linux/amd64 -> out/linux_amd64/
-	$(LIB_RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && MODLINK_DIR=$(MODLINK_DIR) ./scripts/build-lib.sh linux_amd64 "$(VFLAGS) $(MODPATH)"'
+	$(LIB_RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && MODLINK_DIR=$(MODLINK_DIR) ./scripts/build-lib.sh linux_amd64 "$(VFLAGS) -enable-globals $(MODPATH)" $(VERSION)'
 
 lib-all: $(IMAGE_DEP)    ## Same, for every supported target: linux/amd64, linux/arm64, windows/amd64 -> out/<target>/
-	$(LIB_RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && for t in linux_amd64 linux_arm64 windows_amd64; do MODLINK_DIR=$(MODLINK_DIR) ./scripts/build-lib.sh $$t "$(VFLAGS) $(MODPATH)"; done'
+	$(LIB_RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && for t in linux_amd64 linux_arm64 windows_amd64; do MODLINK_DIR=$(MODLINK_DIR) ./scripts/build-lib.sh $$t "$(VFLAGS) -enable-globals $(MODPATH)" $(VERSION); done'
 
 all: lib-all      ## Alias for lib-all: every library artifact, every supported platform
+
+PREFIX ?= /usr/local
+DESTDIR ?=
+
+install: lib      ## Install libsocks (.a/.so + header + pkg-config) from out/linux_amd64 into DESTDIR/PREFIX
+	install -d "$(DESTDIR)$(PREFIX)/lib" "$(DESTDIR)$(PREFIX)/include" "$(DESTDIR)$(PREFIX)/lib/pkgconfig"
+	install -m 644 out/linux_amd64/libsocks.a "$(DESTDIR)$(PREFIX)/lib/"
+	cp -P out/linux_amd64/libsocks.so* "$(DESTDIR)$(PREFIX)/lib/"
+	install -m 644 include/socks.h "$(DESTDIR)$(PREFIX)/include/"
+	sed -e 's#@PREFIX@#$(PREFIX)#' -e 's#@LIBDIR@#$(PREFIX)/lib#' \
+	    -e 's#@INCLUDEDIR@#$(PREFIX)/include#' -e 's#@VERSION@#$(VERSION)#' \
+	    socks.pc.in > "$(DESTDIR)$(PREFIX)/lib/pkgconfig/socks.pc"
 
 build:            ## Build the slim runtime image (compiled CLI, no toolchain)
 	sudo docker build --target runtime -t $(RUNTIME) .
