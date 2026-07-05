@@ -75,6 +75,25 @@ future version that adds the timeouts described above.
   `FRAG != 0x00` is rejected outright rather than reassembled (by design —
   see the project's scope notes — but worth calling out here too).
 
+## Configuration
+
+- **`ServerConfig.resolve_mode` is not consulted by the server.** Setting it
+  to `.client_side` has no effect: `apply()` always hands every `CONNECT`
+  target (including domain names) to the resolver pool for server-side DNS
+  resolution regardless of this field. A caller relying on `.client_side` to
+  make the server refuse to resolve domain names itself (e.g. as an
+  SSRF-avoidance policy, requiring clients to pre-resolve and send IP
+  literals) gets silently ignored configuration. `ClientConfig.resolve_mode`
+  is unaffected by this — it works as documented for `dial()`/`udp_associate()`.
+
+- **`SocksErrorCode.local_timeout` and `.internal_error` are never raised.**
+  Both are part of the public error taxonomy, but no code path in v1
+  constructs either variant. In particular, a client-side handshake read that
+  fails because of `dial()`'s own timeout deadline (rather than a malformed
+  reply from the proxy) is currently reported as `.protocol_error`, not
+  `.local_timeout` — callers cannot yet distinguish "the proxy is slow/hung"
+  from "the proxy sent bytes we couldn't parse" by matching on `err.kind`.
+
 ## Lifecycle
 
 - **The event-loop thread outlives `stop()`/`wait()`.** The underlying
