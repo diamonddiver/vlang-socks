@@ -50,9 +50,19 @@ fn (mut s Server) on_udp_readable(mut pv picoev.Picoev, fd int) {
 	mut buf := []u8{len: 65535}
 	n, peer := r.udp.read(mut buf) or { return }
 	peer_str := peer.str()
-	// The first datagram (and any from the same address) is the client.
-	if r.client_udp == '' || peer_str == r.client_udp {
-		r.client_udp = peer_str
+	// The first datagram claiming to be the client is only trusted if its source
+	// IP matches the TCP control connection's peer IP (RFC 1928 client-binding).
+	// Without this check, any third party who learns the relay's ephemeral UDP
+	// port could register itself as "the client" and hijack the association.
+	is_client := if r.client_udp == '' {
+		peer_str.all_before_last(':') == tcp_client_ip(r)
+	} else {
+		peer_str == r.client_udp
+	}
+	if is_client {
+		if r.client_udp == '' {
+			r.client_udp = peer_str
+		}
 		dg := socks5.parse_udp_datagram(buf[..n]) or { return } // FRAG!=0 => dropped
 		if dg.addr.atyp == .domain {
 			return
@@ -65,6 +75,13 @@ fn (mut s Server) on_udp_readable(mut pv picoev.Picoev, fd int) {
 		caddr := resolve_first(r.client_udp) or { return }
 		r.udp.write_to(caddr, pkt) or {}
 	}
+}
+
+// tcp_client_ip returns the host part of the relay's TCP control connection's
+// peer address, or '' if it can't be determined.
+fn tcp_client_ip(r &Relay) string {
+	a := r.client.peer_addr() or { return '' }
+	return a.str().all_before_last(':')
 }
 
 // build_udp_reply_datagram encodes a target's reply as a SOCKS5 UDP datagram

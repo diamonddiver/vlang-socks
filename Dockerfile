@@ -9,8 +9,17 @@ FROM debian:bookworm-slim AS dev
 # Build/run deps: gcc (V's cgen backend shells out to a C compiler), git (to
 # fetch V + its C bootstrap), libc headers, CA certs. picoev and net are part
 # of vlib — no extra packages needed (epoll on Linux).
+#
+# gcc-aarch64-linux-gnu / gcc-mingw-w64-x86-64: cross C toolchains so
+# `make lib-all` can produce linux/arm64 and windows/amd64 library artifacts
+# from this same linux/amd64 image (see scripts/build-lib.sh). V's `-os`/
+# `-arch`/`-cc` flags drive the cross-compile; picoev and vlib/net compile
+# cleanly under both — confirmed empirically, no macOS cross toolchain is
+# available here (would need osxcross + the Apple SDK), so macOS is not a
+# `make lib-all` target.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc make git ca-certificates libc6-dev \
+        gcc-aarch64-linux-gnu libc6-dev-arm64-cross gcc-mingw-w64-x86-64 \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin V to a known-good release so builds are reproducible and the spikes'

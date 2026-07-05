@@ -2,11 +2,16 @@ module socks
 
 import net
 import sync
+import time
 import picoev
 import socks.core
 import socks.socks5
 import socks.socks4
 import socks.resolver
+
+// sweep_tick is how often reap() checks for handshake timeouts between
+// resolver-result wakeups.
+const sweep_tick = 1 * time.second
 
 // Fd role in the event loop.
 enum FdRole {
@@ -34,6 +39,9 @@ mut:
 	m4        &socks4.Conn4 = unsafe { nil }
 	relaying  bool
 	conn_id   u64 // id of this relay's outstanding resolver job (0 = none)
+	// accepted_at is used by the handshake-timeout sweep to detect connections
+	// that never finish negotiating (see Server.sweep_timeouts).
+	accepted_at time.Time
 	// UDP association fields (SOCKS5 UDP ASSOCIATE)
 	udp        &net.UdpConn = unsafe { nil }
 	udp_fd     int          = -1
@@ -60,6 +68,9 @@ mut:
 	qmu      &sync.Mutex = sync.new_mutex()
 	results  []resolver.Result
 	stopping bool
+	// conn_count is the number of currently accepted connections, enforced
+	// against cfg.max_connections in on_accept. Loop-thread-only.
+	conn_count int
 	// shutdown_done is loop-thread-only; guards shutdown() so pool.close() (which
 	// panics on a double-close of its channel) runs exactly once even though
 	// several notify bytes can arrive after stopping is set.
@@ -189,6 +200,11 @@ fn (mut s Server) reap() {
 			_ := <-s.reaper_stop {
 				break
 			}
+			sweep_tick {
+				// Wake the loop so it can run sweep_timeouts() on the loop
+				// thread (s.relays is only ever safely mutated there).
+				s.notify_w.write([u8(2)]) or {}
+			}
 		}
 	}
 }
@@ -234,22 +250,31 @@ fn raw_cb(fd int, events int, context voidptr) {
 
 fn (mut s Server) on_accept(mut pv picoev.Picoev) {
 	mut c := s.listener.accept() or { return }
+	if s.cfg.max_connections > 0 && s.conn_count >= s.cfg.max_connections {
+		c.close() or {}
+		return
+	}
 	// Deliberately net.infinite_timeout, NOT net.no_timeout / the vlib default:
 	// see dial()'s doc comment in client.v for the full explanation of why
 	// net.no_timeout (Duration(0)) is a plausible-looking WRONG choice on this
 	// V version (a zero-valued time.Time{} quirk makes reads/writes fail in
 	// microseconds instead of blocking). Relay traffic is meant to be long-lived,
 	// so "block forever" must be an explicit, deliberate choice here too, not
-	// whatever a freshly-constructed TcpConn happens to default to.
+	// whatever a freshly-constructed TcpConn happens to default to. The
+	// handshake itself is separately bounded by sweep_timeouts/accepted_at
+	// below, since this socket-level timeout only limits a single blocking
+	// read call and never fires for a connection that sends no bytes at all.
 	c.set_read_timeout(net.infinite_timeout)
 	c.set_write_timeout(net.infinite_timeout)
 	fd := c.sock.handle
 	mut r := &Relay{
-		client:    c
-		client_fd: fd
+		client:      c
+		client_fd:   fd
+		accepted_at: time.now()
 	}
 	s.relays[fd] = r
 	s.roles[fd] = .client
+	s.conn_count++
 	pv_add(mut pv, fd)
 }
 
@@ -360,6 +385,29 @@ fn (mut s Server) on_notify(mut pv picoev.Picoev) {
 	for res in batch {
 		s.on_result(mut pv, res)
 	}
+	s.sweep_timeouts(mut pv)
+}
+
+// sweep_timeouts closes any accepted connection that hasn't finished its
+// SOCKS4/5 handshake within cfg.handshake_timeout. Run on the loop thread only
+// (woken periodically by reap()'s sweep_tick), since s.relays must only be
+// mutated there.
+fn (mut s Server) sweep_timeouts(mut pv picoev.Picoev) {
+	if s.cfg.handshake_timeout <= 0 {
+		return
+	}
+	now := time.now()
+	for fd, _ in s.relays.clone() {
+		mut r := s.relays[fd] or { continue }
+		// Only check once per relay, keyed on its client_fd (target/udp fds
+		// share the same Relay pointer and would otherwise be checked twice).
+		if fd != r.client_fd || r.relaying {
+			continue
+		}
+		if now - r.accepted_at > s.cfg.handshake_timeout {
+			s.close_relay(mut pv, mut r)
+		}
+	}
 }
 
 fn (mut s Server) on_result(mut pv picoev.Picoev, res resolver.Result) {
@@ -462,6 +510,7 @@ fn (mut s Server) close_relay(mut pv picoev.Picoev, mut r Relay) {
 		s.relays.delete(r.client_fd)
 		r.client.close() or {}
 		r.client_fd = -1 // idempotent: a second close_relay on this relay is a no-op
+		s.conn_count--
 	}
 	if r.target_fd >= 0 {
 		pv_del(mut pv, r.target_fd)
