@@ -4,8 +4,8 @@ RUNTIME    := vlang-socks
 MODULE     ?= socks
 CACHE_VOL  := vlang-socks-cache
 
-# Always-Docker recipe prefix, used only by targets that are inherently
-# Docker operations (shell) regardless of the DOCKER toggle below.
+# Always-Docker recipe prefix. Used directly by `shell` (which must always
+# use Docker), and as the base of RUN below when DOCKER=1.
 DOCKER_BASE := sudo docker run --rm -v $(CURDIR):/src -v $(CACHE_VOL):/root/.cache -w /src
 
 # Set DOCKER=0 to run test/vet/fmt/lib targets directly against a
@@ -61,10 +61,10 @@ else
   LIB_RUN :=
 endif
 
-lib: $(IMAGE_DEP)        ## Build shared (.so) + static (.a) + module-cache object for linux/amd64 -> out/linux_amd64/  (DOCKER=0 for host v)
+lib: $(IMAGE_DEP)        ## Build shared (.so) + static (.a) + module-cache object for linux/amd64 -> out/linux_amd64/
 	$(LIB_RUN) $(RUN_IMG) ./scripts/build-lib.sh linux_amd64 "$(VFLAGS)"
 
-lib-all: $(IMAGE_DEP)    ## Same, for every supported target: linux/amd64, linux/arm64, windows/amd64 -> out/<target>/  (DOCKER=0 for host v)
+lib-all: $(IMAGE_DEP)    ## Same, for every supported target: linux/amd64, linux/arm64, windows/amd64 -> out/<target>/
 	$(LIB_RUN) $(RUN_IMG) sh -c 'for t in linux_amd64 linux_arm64 windows_amd64; do ./scripts/build-lib.sh $$t "$(VFLAGS)"; done'
 
 all: lib-all      ## Alias for lib-all: every library artifact, every supported platform
