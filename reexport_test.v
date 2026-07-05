@@ -75,3 +75,31 @@ fn test_socks_error_castable_from_ierror() {
 	}
 	assert false
 }
+
+fn test_error_kind_extracts_code() {
+	returns_socks_err() or {
+		kind := error_kind(err) or {
+			assert false
+			return
+		}
+		assert kind == .host_unreachable
+		return
+	}
+	assert false
+}
+
+fn test_error_kind_none_for_plain_error() {
+	assert error_kind(error('plain')) == none
+}
+
+fn test_error_detail_extracts_message() {
+	returns_socks_err() or {
+		detail := error_detail(err) or {
+			assert false
+			return
+		}
+		assert detail == 'boom'
+		return
+	}
+	assert false
+}

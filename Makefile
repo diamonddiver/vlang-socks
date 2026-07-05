@@ -1,7 +1,7 @@
 # Containerized V toolchain — the host needs only Docker, never V itself.
 IMAGE      := vlang-socks-dev
 RUNTIME    := vlang-socks
-MODULE     ?= socks
+MODULE     ?= .
 CACHE_VOL  := vlang-socks-cache
 
 # Always-Docker recipe prefix. Used directly by `shell` (which must always
@@ -38,20 +38,40 @@ help:               ## Show this help
 # flag, since vlib/net only makes sockets non-blocking under this exact guard).
 VFLAGS := -d net_nonblocking_sockets
 
+# In-repo module resolution. The module is 'socks' but the checkout dir is
+# 'vlang-socks', and V 0.4.8 resolves `import socks` only via a directory
+# literally named `socks`. An in-tree `socks -> .` self-symlink triggers a V
+# import-qualifier compounding bug (the same type registers twice, as
+# socks.core AND socks.socks.core), so instead the module is exposed as `socks`
+# via an EXTERNAL symlink placed OUTSIDE the source tree — no self-reference,
+# and `v fmt/vet/test .` never recurses into it — added to V's module path with
+# `-path @vlib:<dir>` (the @vlib: prefix keeps V's default path alongside it).
+# Created fresh per run so it always points at the current checkout: under
+# DOCKER=1 the dir is baked into the dev image (see Dockerfile); under DOCKER=0
+# (host / CI) the recipe creates it beside the user's V cache.
+ifeq ($(DOCKER),1)
+  MODLINK_DIR   := /opt/vmods
+  MODLINK_SETUP := true
+else
+  MODLINK_DIR   := $(HOME)/.cache/vlang-socks-modlink
+  MODLINK_SETUP := mkdir -p $(MODLINK_DIR) && ln -sfn $(CURDIR) $(MODLINK_DIR)/socks
+endif
+MODPATH := -path @vlib:$(MODLINK_DIR)
+
 image:            ## Build the pinned dev toolchain image (cached after first run)
 	sudo docker build --target dev -t $(IMAGE) .
 
-test: $(IMAGE_DEP)       ## Test one module:  make test MODULE=socks/socks5  (DOCKER=0 for host v)
-	$(RUN) $(RUN_IMG) v $(VFLAGS) test $(MODULE)
+test: $(IMAGE_DEP)       ## Test one module:  make test MODULE=socks5  (DOCKER=0 for host v)
+	$(RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && v $(VFLAGS) $(MODPATH) test $(MODULE)'
 
 test-all: $(IMAGE_DEP)   ## Test every module  (DOCKER=0 for host v)
-	$(RUN) $(RUN_IMG) sh -c 'v $(VFLAGS) test socks/core && v $(VFLAGS) test socks/socks5 && v $(VFLAGS) test socks/socks4 && v $(VFLAGS) test socks/resolver && v $(VFLAGS) test socks && v $(VFLAGS) test cmd/vlang-socks'
+	$(RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && v $(VFLAGS) $(MODPATH) test core && v $(VFLAGS) $(MODPATH) test socks5 && v $(VFLAGS) $(MODPATH) test socks4 && v $(VFLAGS) $(MODPATH) test resolver && v $(VFLAGS) $(MODPATH) test . && v $(VFLAGS) $(MODPATH) test cmd/vlang-socks'
 
 vet: $(IMAGE_DEP)        ## What CI checks: fmt-verify + vet  (DOCKER=0 for host v)
-	$(RUN) $(RUN_IMG) sh -c 'v fmt -verify socks cmd && v vet socks'
+	$(RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && v fmt -verify . cmd && v $(MODPATH) vet .'
 
 fmt: $(IMAGE_DEP)        ## Auto-format in place  (DOCKER=0 for host v)
-	$(RUN) $(RUN_IMG) v fmt -w socks cmd
+	$(RUN) $(RUN_IMG) v fmt -w . cmd
 
 # The container runs as root; build-lib.sh chowns its output back to
 # whichever host uid:gid ran `make`, so out/ doesn't end up root-owned.
@@ -62,10 +82,10 @@ else
 endif
 
 lib: $(IMAGE_DEP)        ## Build shared (.so) + static (.a) + module-cache object for linux/amd64 -> out/linux_amd64/
-	$(LIB_RUN) $(RUN_IMG) ./scripts/build-lib.sh linux_amd64 "$(VFLAGS)"
+	$(LIB_RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && MODLINK_DIR=$(MODLINK_DIR) ./scripts/build-lib.sh linux_amd64 "$(VFLAGS) $(MODPATH)"'
 
 lib-all: $(IMAGE_DEP)    ## Same, for every supported target: linux/amd64, linux/arm64, windows/amd64 -> out/<target>/
-	$(LIB_RUN) $(RUN_IMG) sh -c 'for t in linux_amd64 linux_arm64 windows_amd64; do ./scripts/build-lib.sh $$t "$(VFLAGS)"; done'
+	$(LIB_RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && for t in linux_amd64 linux_arm64 windows_amd64; do MODLINK_DIR=$(MODLINK_DIR) ./scripts/build-lib.sh $$t "$(VFLAGS) $(MODPATH)"; done'
 
 all: lib-all      ## Alias for lib-all: every library artifact, every supported platform
 

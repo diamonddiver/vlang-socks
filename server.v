@@ -656,7 +656,11 @@ fn (mut s Server) read_some(mut c net.TcpConn) ![]u8 {
 	return s.relay_buf[..n]
 }
 
-#include <sys/socket.h>
+$if windows {
+	#include <winsock2.h>
+} $else {
+	#include <sys/socket.h>
+}
 
 fn C.send(sockfd int, buf voidptr, len usize, flags int) int
 

@@ -14,6 +14,24 @@ import socks.core
 pub type SocksError = core.SocksError
 pub type SocksErrorCode = core.SocksErrorCode
 
+// error_kind extracts the SocksErrorCode from an IError, or none if err is
+// not a SocksError. Lets consumers inspect errors without `import socks.core`.
+pub fn error_kind(e IError) ?SocksErrorCode {
+	if e is core.SocksError {
+		return SocksErrorCode(e.kind)
+	}
+	return none
+}
+
+// error_detail extracts the SocksError.detail message from an IError, or
+// none if err is not a SocksError.
+pub fn error_detail(e IError) ?string {
+	if e is core.SocksError {
+		return e.detail
+	}
+	return none
+}
+
 pub enum SocksVersion {
 	v4
 	v4a

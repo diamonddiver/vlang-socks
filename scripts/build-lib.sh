@@ -46,7 +46,7 @@ mkdir -p "$out"
 
 # Shared library: `v -shared` drives its own correct link invocation for
 # every target we support, so no manual gcc reconstruction is needed here.
-v -prod $vflags $os_flag $arch_flag -cc "$cc" -shared -o "$out/libsocks.$ext" socks
+v -prod $vflags $os_flag $arch_flag -cc "$cc" -shared -o "$out/libsocks.$ext" .
 
 # Static library: V refuses to emit an unlinked .o/.a for a non-main module
 # (v -o out.a errors with "project must include a main module or be a
@@ -55,7 +55,7 @@ v -prod $vflags $os_flag $arch_flag -cc "$cc" -shared -o "$out/libsocks.$ext" so
 # The objcc/defines/include-dir below were captured with
 # `strace -f -e trace=execve` against V's own `v -shared` link command for
 # each target; if V's libgc integration changes, re-trace and update here.
-v -prod $vflags $os_flag $arch_flag -cc "$cc" -shared -keepc -o "$out/libsocks.$ext" socks >/dev/null
+v -prod $vflags $os_flag $arch_flag -cc "$cc" -shared -keepc -o "$out/libsocks.$ext" . >/dev/null
 # Pick the newest match: some targets (observed for windows) leave a stray
 # .tmp.so.c behind from the *first* (non-keepc) `v -shared` call above too,
 # so more than one file can match here — the just-generated one is always
@@ -82,7 +82,19 @@ rm -f "$out/libsocks.o"
 # not something this script's flags control. The .dll and .a above are
 # unaffected and are windows' distributable artifacts.
 if [ "$v_os" != "windows" ]; then
-  v $vflags $os_flag $arch_flag build-module socks >/dev/null
+  # `v build-module` (unlike `import`) treats its argument as a literal
+  # filesystem path, not a name resolved via -path/module search — and the
+  # cache filename it produces is derived from that literal argument, not
+  # from v.mod's `name`. Passing "." here would produce
+  # `*.module..o` (empty name component); passing the absolute
+  # /opt/vmods/socks path produces `*.module.opt.vmods.socks.o`. Only running
+  # with "socks" as a *relative* argument, from the one directory where that
+  # name actually resolves (/opt/vmods, see the Dockerfile), reproduces the
+  # expected `*.module.socks.o` cache filename this script's glob below relies
+  # on. cd in a subshell so $out (already absolute) is unaffected. MODLINK_DIR
+  # is where the Makefile placed the external `socks` symlink (/opt/vmods under
+  # DOCKER=1, the host cache dir under DOCKER=0).
+  (cd "${MODLINK_DIR:-/opt/vmods}" && v $vflags $os_flag $arch_flag build-module socks) >/dev/null
   cp "$(ls -t /root/.vmodules/cache/*/*.module.socks.o | head -1)" "$out/socks.module.o"
 fi
 
