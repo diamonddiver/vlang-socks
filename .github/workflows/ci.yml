@@ -1,0 +1,36 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      V_VERSION: "0.4.8"
+      VC_COMMIT: "54beb1f416b404a06b894e6883a0e2368d80bc3e"
+      V_HOME: ${{ github.workspace }}-v-toolchain
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install V build deps (same as Dockerfile dev stage)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc make git ca-certificates libc6-dev
+      - name: Cache V toolchain
+        id: cache-v
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.V_HOME }}
+          key: v-toolchain-${{ env.V_VERSION }}-${{ env.VC_COMMIT }}
+      - name: Bootstrap V (pinned to Dockerfile's exact commits)
+        if: steps.cache-v.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$V_VERSION" https://github.com/vlang/v "$V_HOME"
+          git init -q "$V_HOME/vc"
+          git -C "$V_HOME/vc" remote add origin https://github.com/vlang/vc
+          git -C "$V_HOME/vc" fetch -q --depth 1 origin "$VC_COMMIT"
+          git -C "$V_HOME/vc" checkout -q FETCH_HEAD
+          git clone --filter=blob:none --quiet --branch thirdparty-linux-amd64 https://github.com/vlang/tccbin "$V_HOME/thirdparty/tcc"
+          make -C "$V_HOME" local=1
+      - name: Put v on PATH (skip `v symlink`; it needs root)
+        run: echo "$V_HOME" >> "$GITHUB_PATH"
+      - run: v version
+      - run: make vet DOCKER=0
+      - run: make test-all DOCKER=0

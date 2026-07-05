@@ -1,5 +1,6 @@
 module socks
 
+import time
 import socks.core
 
 fn test_default_server_config() {
@@ -9,6 +10,8 @@ fn test_default_server_config() {
 	assert cfg.versions == [SocksVersion.v4, .v4a, .v5]
 	assert cfg.resolver_threads == 8
 	assert cfg.resolve_mode == .server_side
+	assert cfg.idle_timeout == 0
+	assert cfg.connect_timeout == 30 * time.second
 	match cfg.auth {
 		NoAuth {}
 		else { assert false }
@@ -68,6 +71,34 @@ fn test_socks_error_castable_from_ierror() {
 		se := err as core.SocksError
 		assert se.kind == .host_unreachable
 		assert se.msg() == 'boom'
+		return
+	}
+	assert false
+}
+
+fn test_error_kind_extracts_code() {
+	returns_socks_err() or {
+		kind := error_kind(err) or {
+			assert false
+			return
+		}
+		assert kind == .host_unreachable
+		return
+	}
+	assert false
+}
+
+fn test_error_kind_none_for_plain_error() {
+	assert error_kind(error('plain')) == none
+}
+
+fn test_error_detail_extracts_message() {
+	returns_socks_err() or {
+		detail := error_detail(err) or {
+			assert false
+			return
+		}
+		assert detail == 'boom'
 		return
 	}
 	assert false

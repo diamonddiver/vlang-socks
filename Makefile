@@ -1,7 +1,7 @@
 # Containerized V toolchain — the host needs only Docker, never V itself.
 IMAGE      := vlang-socks-dev
 RUNTIME    := vlang-socks
-MODULE     ?= socks
+MODULE     ?= .
 CACHE_VOL  := vlang-socks-cache
 
 # Always-Docker recipe prefix. Used directly by `shell` (which must always
@@ -24,7 +24,7 @@ else
   IMAGE_DEP :=
 endif
 
-.PHONY: help image test test-all vet fmt build run shell clean lib lib-all all
+.PHONY: help image test test-all test-capi vet fmt build run shell clean lib lib-all all install
 
 .DEFAULT_GOAL := help
 
@@ -38,20 +38,53 @@ help:               ## Show this help
 # flag, since vlib/net only makes sockets non-blocking under this exact guard).
 VFLAGS := -d net_nonblocking_sockets
 
+# In-repo module resolution. The module is 'socks' but the checkout dir is
+# 'vlang-socks', and V 0.4.8 resolves `import socks` only via a directory
+# literally named `socks`. An in-tree `socks -> .` self-symlink triggers a V
+# import-qualifier compounding bug (the same type registers twice, as
+# socks.core AND socks.socks.core), so instead the module is exposed as `socks`
+# via an EXTERNAL symlink placed OUTSIDE the source tree — no self-reference,
+# and `v fmt/vet/test .` never recurses into it — added to V's module path with
+# `-path @vlib:<dir>` (the @vlib: prefix keeps V's default path alongside it).
+# Created fresh per run so it always points at the current checkout: under
+# DOCKER=1 the dir is baked into the dev image (see Dockerfile); under DOCKER=0
+# (host / CI) the recipe creates it beside the user's V cache.
+ifeq ($(DOCKER),1)
+  MODLINK_DIR   := /opt/vmods
+  MODLINK_SETUP := true
+else
+  MODLINK_DIR   := $(HOME)/.cache/vlang-socks-modlink
+  MODLINK_SETUP := mkdir -p $(MODLINK_DIR) && ln -sfn $(CURDIR) $(MODLINK_DIR)/socks
+endif
+MODPATH := -path @vlib:$(MODLINK_DIR)
+
+# Library version, parsed from v.mod's `version: '...'` (single source of
+# truth) — drives the SONAME/versioned-filename chain build-lib.sh produces
+# and the pkg-config file `install` generates.
+VERSION := $(shell sed -n "s/^[[:space:]]*version: *'\([^']*\)'.*/\1/p" v.mod)
+
 image:            ## Build the pinned dev toolchain image (cached after first run)
 	sudo docker build --target dev -t $(IMAGE) .
 
-test: $(IMAGE_DEP)       ## Test one module:  make test MODULE=socks/socks5  (DOCKER=0 for host v)
-	$(RUN) $(RUN_IMG) v $(VFLAGS) test $(MODULE)
+test: $(IMAGE_DEP)       ## Test one module:  make test MODULE=socks5  (DOCKER=0 for host v)
+	$(RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && v $(VFLAGS) $(MODPATH) test $(MODULE)'
 
 test-all: $(IMAGE_DEP)   ## Test every module  (DOCKER=0 for host v)
-	$(RUN) $(RUN_IMG) sh -c 'v $(VFLAGS) test socks/core && v $(VFLAGS) test socks/socks5 && v $(VFLAGS) test socks/socks4 && v $(VFLAGS) test socks/resolver && v $(VFLAGS) test socks && v $(VFLAGS) test cmd/vlang-socks'
+	$(RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && v $(VFLAGS) $(MODPATH) test core && v $(VFLAGS) $(MODPATH) test socks5 && v $(VFLAGS) $(MODPATH) test socks4 && v $(VFLAGS) $(MODPATH) test resolver && v $(VFLAGS) -enable-globals $(MODPATH) test . && v $(VFLAGS) $(MODPATH) test cmd/vlang-socks'
+
+# `v test .`'s directory walk (used by test-all above) has no way to exclude
+# a named subdirectory, so it always descends into capi/ too — hence -enable-
+# globals on that one invocation, harmless for every other module (the flag
+# only unlocks syntax, it doesn't change codegen for code that isn't using
+# it). This target exists in addition so `capi` can be tested on its own.
+test-capi: $(IMAGE_DEP)  ## Test the capi module (needs -enable-globals)  (DOCKER=0 for host v)
+	$(RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && v $(VFLAGS) -enable-globals $(MODPATH) test capi'
 
 vet: $(IMAGE_DEP)        ## What CI checks: fmt-verify + vet  (DOCKER=0 for host v)
-	$(RUN) $(RUN_IMG) sh -c 'v fmt -verify socks cmd && v vet socks'
+	$(RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && v fmt -verify . cmd && v $(MODPATH) vet .'
 
 fmt: $(IMAGE_DEP)        ## Auto-format in place  (DOCKER=0 for host v)
-	$(RUN) $(RUN_IMG) v fmt -w socks cmd
+	$(RUN) $(RUN_IMG) v fmt -w . cmd
 
 # The container runs as root; build-lib.sh chowns its output back to
 # whichever host uid:gid ran `make`, so out/ doesn't end up root-owned.
@@ -61,13 +94,28 @@ else
   LIB_RUN :=
 endif
 
+# -enable-globals: the lib is built from the `capi` module (which pulls in
+# `socks` transitively), not from `.` — capi's handle registry needs it, but
+# plain V consumers doing `import socks` never link capi and never need it.
 lib: $(IMAGE_DEP)        ## Build shared (.so) + static (.a) + module-cache object for linux/amd64 -> out/linux_amd64/
-	$(LIB_RUN) $(RUN_IMG) ./scripts/build-lib.sh linux_amd64 "$(VFLAGS)"
+	$(LIB_RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && MODLINK_DIR=$(MODLINK_DIR) ./scripts/build-lib.sh linux_amd64 "$(VFLAGS) -enable-globals $(MODPATH)" $(VERSION)'
 
 lib-all: $(IMAGE_DEP)    ## Same, for every supported target: linux/amd64, linux/arm64, windows/amd64 -> out/<target>/
-	$(LIB_RUN) $(RUN_IMG) sh -c 'for t in linux_amd64 linux_arm64 windows_amd64; do ./scripts/build-lib.sh $$t "$(VFLAGS)"; done'
+	$(LIB_RUN) $(RUN_IMG) sh -c '$(MODLINK_SETUP) && for t in linux_amd64 linux_arm64 windows_amd64; do MODLINK_DIR=$(MODLINK_DIR) ./scripts/build-lib.sh $$t "$(VFLAGS) -enable-globals $(MODPATH)" $(VERSION); done'
 
 all: lib-all      ## Alias for lib-all: every library artifact, every supported platform
+
+PREFIX ?= /usr/local
+DESTDIR ?=
+
+install: lib      ## Install libsocks (.a/.so + header + pkg-config) from out/linux_amd64 into DESTDIR/PREFIX
+	install -d "$(DESTDIR)$(PREFIX)/lib" "$(DESTDIR)$(PREFIX)/include" "$(DESTDIR)$(PREFIX)/lib/pkgconfig"
+	install -m 644 out/linux_amd64/libsocks.a "$(DESTDIR)$(PREFIX)/lib/"
+	cp -P out/linux_amd64/libsocks.so* "$(DESTDIR)$(PREFIX)/lib/"
+	install -m 644 include/socks.h "$(DESTDIR)$(PREFIX)/include/"
+	sed -e 's#@PREFIX@#$(PREFIX)#' -e 's#@LIBDIR@#$(PREFIX)/lib#' \
+	    -e 's#@INCLUDEDIR@#$(PREFIX)/include#' -e 's#@VERSION@#$(VERSION)#' \
+	    socks.pc.in > "$(DESTDIR)$(PREFIX)/lib/pkgconfig/socks.pc"
 
 build:            ## Build the slim runtime image (compiled CLI, no toolchain)
 	sudo docker build --target runtime -t $(RUNTIME) .

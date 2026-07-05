@@ -1,0 +1,24 @@
+# Linker version-script for libsocks.so: restricts the dynamic symbol table
+# to exactly the capi module's @[export]'ed C ABI. A `socks_*` glob would
+# ALSO match the ~1800 mangled `socks__*` (double underscore) symbols V emits
+# for every internal function/method of module socks and its subpackages, so
+# every name is enumerated explicitly instead. Keep in sync with the
+# `@[export: '...']` attributes under capi/*.v.
+{
+  global:
+    socks_init;
+    socks_last_error_code;
+    socks_last_error_message;
+    socks_strerror;
+    socks_server_start;
+    socks_server_stop;
+    socks_server_wait;
+    socks_server_addr;
+    socks_dial;
+    socks_udp_associate;
+    socks_udp_write_to;
+    socks_udp_read_from;
+    socks_udp_close;
+  local:
+    *;
+};

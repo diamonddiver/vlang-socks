@@ -1,5 +1,6 @@
 module socks
 
+import time
 import socks.core
 
 // Re-export the error types so users only ever import `socks`.
@@ -12,6 +13,24 @@ import socks.core
 // core.SocksError`, as this codebase's own tests and internal code all do.
 pub type SocksError = core.SocksError
 pub type SocksErrorCode = core.SocksErrorCode
+
+// error_kind extracts the SocksErrorCode from an IError, or none if err is
+// not a SocksError. Lets consumers inspect errors without `import socks.core`.
+pub fn error_kind(e IError) ?SocksErrorCode {
+	if e is core.SocksError {
+		return SocksErrorCode(e.kind)
+	}
+	return none
+}
+
+// error_detail extracts the SocksError.detail message from an IError, or
+// none if err is not a SocksError.
+pub fn error_detail(e IError) ?string {
+	if e is core.SocksError {
+		return e.detail
+	}
+	return none
+}
 
 pub enum SocksVersion {
 	v4
@@ -54,6 +73,27 @@ pub mut:
 	versions         []SocksVersion = [.v4, .v4a, .v5]
 	resolver_threads int            = 8
 	log_connections  bool // default false; the CLI enables it
+	// handshake_timeout bounds how long an accepted TCP connection may sit
+	// before completing its SOCKS4/5 negotiation. A client that never finishes
+	// the handshake (or trickles bytes slow-loris style) is closed once this
+	// elapses. <= 0 disables the check (connection held open forever, the old
+	// behavior). Does not apply once relaying has started: established relay
+	// traffic is intentionally allowed to idle indefinitely.
+	handshake_timeout time.Duration = 30 * time.second
+	// max_connections caps the number of concurrent accepted connections.
+	// <= 0 (default) means unlimited, matching the old behavior.
+	max_connections int
+	// idle_timeout bounds how long an established relay (post-handshake) may
+	// sit with no traffic in either direction before being closed. <= 0
+	// (default) disables the check: established relay traffic idles forever,
+	// the old behavior.
+	idle_timeout time.Duration
+	// connect_timeout bounds how long a single resolver worker may block
+	// dialing a target. Once it elapses the worker slot is freed (the
+	// connection fails with .local_timeout) even though the underlying OS
+	// dial is not cancelled. <= 0 disables the bound, preserving the old
+	// unbounded-dial behavior.
+	connect_timeout time.Duration = 30 * time.second
 }
 
 pub struct ClientConfig {

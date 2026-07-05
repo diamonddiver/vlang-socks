@@ -2,11 +2,21 @@ module socks
 
 import net
 import sync
+import time
 import picoev
 import socks.core
 import socks.socks5
 import socks.socks4
 import socks.resolver
+
+// sweep_tick is how often reap() checks for handshake timeouts between
+// resolver-result wakeups.
+const sweep_tick = 1 * time.second
+
+// relay_hwm is the fixed backpressure high-water mark: once a relay
+// direction's outbound queue exceeds this many bytes, the opposite side's
+// read interest is paused until the queue drains back under it.
+const relay_hwm = 256 * 1024
 
 // Fd role in the event loop.
 enum FdRole {
@@ -34,6 +44,22 @@ mut:
 	m4        &socks4.Conn4 = unsafe { nil }
 	relaying  bool
 	conn_id   u64 // id of this relay's outstanding resolver job (0 = none)
+	// accepted_at is used by the handshake-timeout sweep to detect connections
+	// that never finish negotiating (see Server.sweep_timeouts).
+	accepted_at time.Time
+	// last_activity is updated on every successful client/target/UDP read
+	// once relaying has started; the idle-timeout sweep closes a relay whose
+	// last_activity is too old.
+	last_activity time.Time
+	// client_out / target_out hold bytes that couldn't be sent immediately
+	// (EAGAIN) to the client / target, in send order — drained by
+	// drain_client / drain_target on the next writable event. client_paused /
+	// target_paused mirror whether the OPPOSITE side's read interest is
+	// currently disabled because this queue exceeded relay_hwm (backpressure).
+	client_out    []u8
+	target_out    []u8
+	client_paused bool
+	target_paused bool
 	// UDP association fields (SOCKS5 UDP ASSOCIATE)
 	udp        &net.UdpConn = unsafe { nil }
 	udp_fd     int          = -1
@@ -56,10 +82,20 @@ mut:
 	relays  map[int]&Relay // both client_fd and target_fd key the same Relay
 	next_id u64            // monotonic resolver-job id (NEVER an fd — avoids fd-reuse aliasing)
 	pending map[u64]&Relay // outstanding resolver jobs, keyed by job id
+	// relay_buf is the single shared read buffer for read_some. Safe to reuse
+	// across calls: read_some only ever runs on the picoev loop thread (from
+	// raw_cb), and by the time try_send()/write() returns, its data argument
+	// has already been copied to the kernel — or the unsent remainder has
+	// been .clone()'d into a per-relay queue — so overwriting relay_buf on
+	// the next read_some call never races with a still-in-flight caller.
+	relay_buf []u8 = []u8{len: 65536}
 	// results queue + stop flag (shared: guarded by qmu).
 	qmu      &sync.Mutex = sync.new_mutex()
 	results  []resolver.Result
 	stopping bool
+	// conn_count is the number of currently accepted connections, enforced
+	// against cfg.max_connections in on_accept. Loop-thread-only.
+	conn_count int
 	// shutdown_done is loop-thread-only; guards shutdown() so pool.close() (which
 	// panics on a double-close of its channel) runs exactly once even though
 	// several notify bytes can arrive after stopping is set.
@@ -112,7 +148,7 @@ pub fn spawn_serve(cfg ServerConfig) !ServerHandle {
 		l.close() or {}
 		return err
 	}
-	mut pool := resolver.new(cfg.resolver_threads)
+	mut pool := resolver.new(cfg.resolver_threads, cfg.connect_timeout)
 	mut srv := &Server{
 		cfg:         cfg
 		bound_addr:  bound
@@ -189,6 +225,11 @@ fn (mut s Server) reap() {
 			_ := <-s.reaper_stop {
 				break
 			}
+			sweep_tick {
+				// Wake the loop so it can run sweep_timeouts() on the loop
+				// thread (s.relays is only ever safely mutated there).
+				s.notify_w.write([u8(2)]) or {}
+			}
 		}
 	}
 }
@@ -223,39 +264,58 @@ fn raw_cb(fd int, events int, context voidptr) {
 	mut pv := unsafe { &picoev.Picoev(context) }
 	mut s := unsafe { &Server(pv.user_data) }
 	role := s.roles[fd] or { return }
-	match role {
-		.listener { s.on_accept(mut pv) }
-		.notify { s.on_notify(mut pv) }
-		.client { s.on_client_readable(mut pv, fd) }
-		.target { s.on_target_readable(mut pv, fd) }
-		.udp { s.on_udp_readable(mut pv, fd) }
+	if (role == .client || role == .target) && events & picoev.picoev_write != 0 {
+		s.on_writable(mut pv, fd, role)
+		// on_writable may have closed the relay on a hard send error — bail
+		// before touching read handling below if so.
+		if fd !in s.roles {
+			return
+		}
+	}
+	if events & picoev.picoev_read != 0 {
+		match role {
+			.listener { s.on_accept(mut pv) }
+			.notify { s.on_notify(mut pv) }
+			.client { s.on_client_readable(mut pv, fd) }
+			.target { s.on_target_readable(mut pv, fd) }
+			.udp { s.on_udp_readable(mut pv, fd) }
+		}
 	}
 }
 
 fn (mut s Server) on_accept(mut pv picoev.Picoev) {
 	mut c := s.listener.accept() or { return }
+	if s.cfg.max_connections > 0 && s.conn_count >= s.cfg.max_connections {
+		c.close() or {}
+		return
+	}
 	// Deliberately net.infinite_timeout, NOT net.no_timeout / the vlib default:
 	// see dial()'s doc comment in client.v for the full explanation of why
 	// net.no_timeout (Duration(0)) is a plausible-looking WRONG choice on this
 	// V version (a zero-valued time.Time{} quirk makes reads/writes fail in
 	// microseconds instead of blocking). Relay traffic is meant to be long-lived,
 	// so "block forever" must be an explicit, deliberate choice here too, not
-	// whatever a freshly-constructed TcpConn happens to default to.
+	// whatever a freshly-constructed TcpConn happens to default to. The
+	// handshake itself is separately bounded by sweep_timeouts/accepted_at
+	// below, since this socket-level timeout only limits a single blocking
+	// read call and never fires for a connection that sends no bytes at all.
 	c.set_read_timeout(net.infinite_timeout)
 	c.set_write_timeout(net.infinite_timeout)
 	fd := c.sock.handle
 	mut r := &Relay{
-		client:    c
-		client_fd: fd
+		client:      c
+		client_fd:   fd
+		accepted_at: time.now()
 	}
 	s.relays[fd] = r
 	s.roles[fd] = .client
+	s.conn_count++
 	pv_add(mut pv, fd)
 }
 
 fn (mut s Server) on_client_readable(mut pv picoev.Picoev, fd int) {
 	mut r := s.relays[fd] or { return }
-	data := read_some(mut r.client) or {
+	data := s.read_some(mut r.client) or {
 		s.close_relay(mut pv, mut r)
 		return
 	}
@@ -263,10 +323,11 @@ fn (mut s Server) on_client_readable(mut pv picoev.Picoev, fd int) {
 		s.close_relay(mut pv, mut r)
 		return
 	}
+	r.last_activity = time.now()
 	if r.relaying {
 		// forward client -> target
 		if r.target_fd >= 0 {
-			r.target.write(data) or { s.close_relay(mut pv, mut r) }
+			s.send_to_target(mut pv, mut r, data)
 		}
 		return
 	}
@@ -311,9 +372,17 @@ fn (mut s Server) drive(mut pv picoev.Picoev, mut r Relay, data []u8) {
 
 fn (mut s Server) apply(mut pv picoev.Picoev, mut r Relay, act core.Action) {
 	if act.reply.len > 0 {
-		r.client.write(act.reply) or {
+		// Small SOCKS reply frame. Non-blocking send; queue any unsent
+		// remainder so the full reply is guaranteed to reach the client in
+		// order before any later client_out bytes (see try_send's doc
+		// comment for why TcpConn.write is unusable here).
+		n := try_send(r.client_fd, act.reply) or {
 			s.close_relay(mut pv, mut r)
 			return
+		}
+		if n < act.reply.len {
+			r.client_out << act.reply[n..].clone()
+			s.sync_client_interest(mut pv, mut r)
 		}
 	}
 	if act.close {
@@ -360,6 +429,36 @@ fn (mut s Server) on_notify(mut pv picoev.Picoev) {
 	for res in batch {
 		s.on_result(mut pv, res)
 	}
+	s.sweep_timeouts(mut pv)
+}
+
+// sweep_timeouts closes any accepted connection that hasn't finished its
+// SOCKS4/5 handshake within cfg.handshake_timeout, and any established relay
+// that has idled (no successful read in either direction) longer than
+// cfg.idle_timeout. Run on the loop thread only (woken periodically by
+// reap()'s sweep_tick), since s.relays must only be mutated there.
+fn (mut s Server) sweep_timeouts(mut pv picoev.Picoev) {
+	if s.cfg.handshake_timeout <= 0 && s.cfg.idle_timeout <= 0 {
+		return
+	}
+	now := time.now()
+	for fd, _ in s.relays.clone() {
+		mut r := s.relays[fd] or { continue }
+		// Only check once per relay, keyed on its client_fd (target/udp fds
+		// share the same Relay pointer and would otherwise be checked twice).
+		if fd != r.client_fd {
+			continue
+		}
+		if r.relaying {
+			if s.cfg.idle_timeout > 0 && now - r.last_activity > s.cfg.idle_timeout {
+				s.close_relay(mut pv, mut r)
+			}
+		} else {
+			if s.cfg.handshake_timeout > 0 && now - r.accepted_at > s.cfg.handshake_timeout {
+				s.close_relay(mut pv, mut r)
+			}
+		}
+	}
 }
 
 fn (mut s Server) on_result(mut pv picoev.Picoev, res resolver.Result) {
@@ -396,11 +495,31 @@ fn (mut s Server) on_result(mut pv picoev.Picoev, res resolver.Result) {
 		} else {
 			r.m4.on_connected()
 		}
-		r.client.write(act.reply) or {
+		// SUCCESS reply. Queue any unsent remainder so the client is
+		// guaranteed the COMPLETE reply frame before any relay bytes: after
+		// this we set relaying=true and start forwarding target->client via
+		// send_to_client (which appends after client_out), so a partial
+		// reply left unqueued would let the client read relay data as the
+		// tail of the SOCKS reply => protocol desync. Sent BEFORE
+		// relaying=true / target registration so it always leads the queue.
+		n := try_send(r.client_fd, act.reply) or {
 			s.close_relay(mut pv, mut r)
 			return
 		}
+		if n < act.reply.len {
+			r.client_out << act.reply[n..].clone()
+			s.sync_client_interest(mut pv, mut r)
+		}
 		r.relaying = true
+		r.last_activity = time.now()
+		// Register the target fd (and its role) BEFORE flushing any
+		// pipelined leftover below: send_to_target's own interest sync must
+		// be the last word on the target fd's epoll interest, or this
+		// pv_add's plain read-only interest (issued afterwards) would
+		// clobber a write-interest bit it had just armed for a slow target.
+		s.relays[r.target_fd] = r
+		s.roles[r.target_fd] = .target
+		pv_add(mut pv, r.target_fd)
 		// Flush any client bytes that arrived pipelined before the reply. They
 		// were buffered in the state machine (the request-parsing loop leaves the
 		// post-request tail in `buf`, and any bytes read while .pending are
@@ -409,19 +528,13 @@ fn (mut s Server) on_result(mut pv picoev.Picoev, res resolver.Result) {
 		// client that sends CONNECT + payload in one segment loses the payload.
 		mut leftover := if r.fam == .socks5 { r.m5.buf } else { r.m4.buf }
 		if leftover.len > 0 {
-			r.target.write(leftover) or {
-				s.close_relay(mut pv, mut r)
-				return
-			}
+			s.send_to_target(mut pv, mut r, leftover)
 			if r.fam == .socks5 {
 				r.m5.buf = []u8{}
 			} else {
 				r.m4.buf = []u8{}
 			}
 		}
-		s.relays[r.target_fd] = r
-		s.roles[r.target_fd] = .target
-		pv_add(mut pv, r.target_fd)
 	} else {
 		kind := if e := res.err { e.kind } else { core.SocksErrorCode.general_failure }
 		s.fail_relay(mut pv, mut r, kind)
@@ -430,7 +543,7 @@ fn (mut s Server) on_result(mut pv picoev.Picoev, res resolver.Result) {
 
 fn (mut s Server) on_target_readable(mut pv picoev.Picoev, fd int) {
 	mut r := s.relays[fd] or { return }
-	data := read_some(mut r.target) or {
+	data := s.read_some(mut r.target) or {
 		s.close_relay(mut pv, mut r)
 		return
 	}
@@ -438,7 +551,8 @@ fn (mut s Server) on_target_readable(mut pv picoev.Picoev, fd int) {
 		s.close_relay(mut pv, mut r)
 		return
 	}
-	r.client.write(data) or { s.close_relay(mut pv, mut r) }
+	r.last_activity = time.now()
+	s.send_to_client(mut pv, mut r, data)
 }
 
 fn (mut s Server) fail_relay(mut pv picoev.Picoev, mut r Relay, kind core.SocksErrorCode) {
@@ -447,7 +561,7 @@ fn (mut s Server) fail_relay(mut pv picoev.Picoev, mut r Relay, kind core.SocksE
 	} else {
 		r.m4.on_failed(kind)
 	}
-	r.client.write(act.reply) or {}
+	try_send(r.client_fd, act.reply) or {}
 	s.close_relay(mut pv, mut r)
 }
 
@@ -462,6 +576,7 @@ fn (mut s Server) close_relay(mut pv picoev.Picoev, mut r Relay) {
 		s.relays.delete(r.client_fd)
 		r.client.close() or {}
 		r.client_fd = -1 // idempotent: a second close_relay on this relay is a no-op
+		s.conn_count--
 	}
 	if r.target_fd >= 0 {
 		pv_del(mut pv, r.target_fd)
@@ -533,11 +648,156 @@ fn (s Server) socks4_cfg() socks4.Conn4Config {
 	}
 }
 
-// read_some reads whatever is currently available (picoev signalled readable).
-fn read_some(mut c net.TcpConn) ![]u8 {
-	mut buf := []u8{len: 4096}
-	n := c.read(mut buf) or { return err }
-	return buf[..n].clone()
+// read_some reads whatever is currently available (picoev signalled readable)
+// into the shared relay_buf and returns a view of just the bytes read. See
+// relay_buf's doc comment on Server for why reusing that buffer is safe.
+fn (mut s Server) read_some(mut c net.TcpConn) ![]u8 {
+	n := c.read(mut s.relay_buf) or { return err }
+	return s.relay_buf[..n]
+}
+
+$if windows {
+	#include <winsock2.h>
+} $else {
+	#include <sys/socket.h>
+}
+
+fn C.send(sockfd int, buf voidptr, len usize, flags int) int
+
+// try_send attempts exactly one non-blocking send of data and returns how
+// many bytes actually went to the kernel (0 if the socket isn't currently
+// writable — not an error).
+//
+// TcpConn.write()/write_ptr() are unusable for relay writes: on EAGAIN,
+// vlib's write_ptr calls a BLOCKING select() gated by the socket's write
+// deadline (relay sockets use net.infinite_timeout, i.e. block forever), and
+// it discards the partial-sent count on top of that. Either one of those
+// would stall the whole event loop on a single slow peer. Binding vlib's own
+// raw C.send with MSG_DONTWAIT sidesteps both: it never blocks, and it
+// reports exactly how much was sent so the caller can queue the remainder.
+fn try_send(fd int, data []u8) !int {
+	if data.len == 0 {
+		return 0
+	}
+	n := C.send(fd, data.data, usize(data.len), net.msg_dontwait | net.msg_nosignal)
+	if n >= 0 {
+		return n
+	}
+	code := net.error_code()
+	if code == int(net.error_ewouldblock) || code == int(net.error_eagain) {
+		return 0
+	}
+	return error('send failed: errno ${code}')
+}
+
+// send_to_target sends data toward the target, queuing whatever the kernel
+// won't take right now. Never sends ahead of an existing backlog: if
+// target_out already has bytes queued, data is appended behind them instead
+// of racing a fresh try_send in front of the backlog.
+fn (mut s Server) send_to_target(mut pv picoev.Picoev, mut r Relay, data []u8) {
+	if r.target_out.len == 0 {
+		n := try_send(r.target_fd, data) or {
+			s.close_relay(mut pv, mut r)
+			return
+		}
+		if n < data.len {
+			r.target_out << data[n..].clone()
+		}
+	} else {
+		r.target_out << data.clone()
+	}
+	r.client_paused = r.target_out.len > relay_hwm
+	s.sync_client_interest(mut pv, mut r)
+	s.sync_target_interest(mut pv, mut r)
+}
+
+// send_to_client mirrors send_to_target for the client direction.
+fn (mut s Server) send_to_client(mut pv picoev.Picoev, mut r Relay, data []u8) {
+	if r.client_out.len == 0 {
+		n := try_send(r.client_fd, data) or {
+			s.close_relay(mut pv, mut r)
+			return
+		}
+		if n < data.len {
+			r.client_out << data[n..].clone()
+		}
+	} else {
+		r.client_out << data.clone()
+	}
+	r.target_paused = r.client_out.len > relay_hwm
+	s.sync_client_interest(mut pv, mut r)
+	s.sync_target_interest(mut pv, mut r)
+}
+
+// drain_target retries the queued backlog toward target on a writable event,
+// slicing off whatever the kernel accepted this time.
+fn (mut s Server) drain_target(mut pv picoev.Picoev, mut r Relay) {
+	n := try_send(r.target_fd, r.target_out) or {
+		s.close_relay(mut pv, mut r)
+		return
+	}
+	r.target_out = r.target_out[n..]
+	r.client_paused = r.target_out.len > relay_hwm
+	s.sync_client_interest(mut pv, mut r)
+	s.sync_target_interest(mut pv, mut r)
+}
+
+// drain_client mirrors drain_target for the client direction.
+fn (mut s Server) drain_client(mut pv picoev.Picoev, mut r Relay) {
+	n := try_send(r.client_fd, r.client_out) or {
+		s.close_relay(mut pv, mut r)
+		return
+	}
+	r.client_out = r.client_out[n..]
+	r.target_paused = r.client_out.len > relay_hwm
+	s.sync_client_interest(mut pv, mut r)
+	s.sync_target_interest(mut pv, mut r)
+}
+
+// sync_client_interest re-arms the client fd's epoll interest: read unless
+// paused, write only while client_out still has bytes queued. Clearing the
+// write bit the instant the queue empties is mandatory — picoev's EPOLLOUT
+// is level-triggered, so leaving it set on an empty queue would busy-spin
+// the loop at 100% CPU on an idle connection whose peer merely has free
+// buffer.
+fn (mut s Server) sync_client_interest(mut pv picoev.Picoev, mut r Relay) {
+	if r.client_fd < 0 {
+		return
+	}
+	mut events := 0
+	if !r.client_paused {
+		events |= picoev.picoev_read
+	}
+	if r.client_out.len > 0 {
+		events |= picoev.picoev_write
+	}
+	pv.add(r.client_fd, events, 0, raw_cb)
+}
+
+// sync_target_interest mirrors sync_client_interest for the target fd.
+fn (mut s Server) sync_target_interest(mut pv picoev.Picoev, mut r Relay) {
+	if r.target_fd < 0 {
+		return
+	}
+	mut events := 0
+	if !r.target_paused {
+		events |= picoev.picoev_read
+	}
+	if r.target_out.len > 0 {
+		events |= picoev.picoev_write
+	}
+	pv.add(r.target_fd, events, 0, raw_cb)
+}
+
+// on_writable handles a writable event on a client/target fd by draining
+// that side's queued backlog.
+fn (mut s Server) on_writable(mut pv picoev.Picoev, fd int, role FdRole) {
+	mut r := s.relays[fd] or { return }
+	if role == .client {
+		s.drain_client(mut pv, mut r)
+	} else {
+		s.drain_target(mut pv, mut r)
+	}
 }
 
 // --- picoev primitives (adapted to the API confirmed in Spike B) ---

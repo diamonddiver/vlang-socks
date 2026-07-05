@@ -28,7 +28,7 @@ fn test_resolver_connects_and_reports() {
 	}
 	host := addr.all_before_last(':')
 	port := addr.all_after_last(':').u16()
-	mut p := new(2)
+	mut p := new(2, 0)
 	defer {
 		p.close()
 	}
@@ -50,7 +50,7 @@ fn test_resolver_connects_and_reports() {
 }
 
 fn test_resolver_reports_failure() {
-	mut p := new(1)
+	mut p := new(1, 0)
 	defer {
 		p.close()
 	}
@@ -68,7 +68,17 @@ fn test_resolver_reports_failure() {
 		assert false // must not have connected
 	}
 	e := r.err or { panic('expected an error') }
-	assert e.kind in [core.SocksErrorCode.connection_refused, .host_unreachable, .general_failure]
+	assert e.kind in [core.SocksErrorCode.connection_refused, .host_unreachable, .internal_error]
+}
+
+// test_classify_unrecognized_error_is_internal guards the catch-all branch:
+// an OS/dial error whose message matches none of the recognized keywords
+// must classify as .internal_error (a local "couldn't classify this"
+// marker), not silently masquerade as .general_failure (a remote-reported
+// code implying the peer itself rejected the connection).
+fn test_classify_unrecognized_error_is_internal() {
+	e := classify(error('made-up'), core.Target{ host: '1.2.3.4', port: 80 })
+	assert e.kind == .internal_error
 }
 
 fn test_try_submit_reports_false_when_queue_full() {

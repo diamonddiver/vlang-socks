@@ -2,6 +2,7 @@ module socks
 
 import net
 import time
+import picoev
 import socks.core
 import socks.socks5
 
@@ -167,6 +168,77 @@ fn test_udp_fragmented_datagram_dropped_by_live_relay() {
 	_, data := sess.read_from()!
 	assert data == 'OK'.bytes() // never 'DROP' — the relay dropped the fragment
 	sess.close()
+}
+
+// test_sweep_timeouts_closes_idle_relay is built by direct construction
+// (mirroring test_apply_replies_failure_when_resolver_queue_full's style in
+// server_test.v): a relaying Relay whose last_activity is stale must be
+// closed by sweep_timeouts once idle_timeout elapses.
+fn test_sweep_timeouts_closes_idle_relay() {
+	mut pv := picoev.new(picoev.Config{
+		port:   0
+		family: .ip
+	})!
+	mut srv := &Server{
+		cfg: ServerConfig{
+			idle_timeout: 10 * time.millisecond
+		}
+	}
+	mut l := net.listen_tcp(.ip, '127.0.0.1:0')!
+	addr := l.addr()!.str()
+	mut proxy_side := net.dial_tcp(addr)!
+	mut client_side := l.accept()!
+	l.close() or {}
+
+	fd := proxy_side.sock.handle
+	mut r := &Relay{
+		client:        proxy_side
+		client_fd:     fd
+		relaying:      true
+		last_activity: time.now().add(-1 * time.second)
+	}
+	srv.relays[fd] = r
+	pv_add(mut pv, fd)
+
+	srv.sweep_timeouts(mut pv)
+
+	assert fd !in srv.relays
+	client_side.close() or {}
+}
+
+// test_sweep_timeouts_spares_fresh_relay is the companion regression: a
+// relaying Relay with a recent last_activity must survive the same sweep.
+fn test_sweep_timeouts_spares_fresh_relay() {
+	mut pv := picoev.new(picoev.Config{
+		port:   0
+		family: .ip
+	})!
+	mut srv := &Server{
+		cfg: ServerConfig{
+			idle_timeout: 10 * time.second
+		}
+	}
+	mut l := net.listen_tcp(.ip, '127.0.0.1:0')!
+	addr := l.addr()!.str()
+	mut proxy_side := net.dial_tcp(addr)!
+	mut client_side := l.accept()!
+	l.close() or {}
+
+	fd := proxy_side.sock.handle
+	mut r := &Relay{
+		client:        proxy_side
+		client_fd:     fd
+		relaying:      true
+		last_activity: time.now()
+	}
+	srv.relays[fd] = r
+	pv_add(mut pv, fd)
+
+	srv.sweep_timeouts(mut pv)
+
+	assert fd in srv.relays
+	proxy_side.close() or {}
+	client_side.close() or {}
 }
 
 fn test_connect_refused_port() {
