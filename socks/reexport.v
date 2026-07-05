@@ -3,6 +3,13 @@ module socks
 import socks.core
 
 // Re-export the error types so users only ever import `socks`.
+//
+// Known V 0.4.8 toolchain limitation: casting via this alias — `err as
+// SocksError` (or `err as socks.SocksError` from outside the module) — fails
+// to compile with a C backend error; V's IError dispatch machinery emits a
+// union member for the alias name but no matching C typedef. Cast to the
+// underlying real type instead: `import socks.core` and use `err as
+// core.SocksError`, as this codebase's own tests and internal code all do.
 pub type SocksError = core.SocksError
 pub type SocksErrorCode = core.SocksErrorCode
 
