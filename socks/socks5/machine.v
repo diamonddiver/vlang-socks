@@ -21,11 +21,9 @@ pub:
 
 pub struct Conn5 {
 pub mut:
-	cfg          Conn5Config
-	stage        Stage
-	buf          []u8
-	pending_cmd  Command
-	pending_addr Addr
+	cfg   Conn5Config
+	stage Stage
+	buf   []u8
 }
 
 fn wait() core.Action {
@@ -132,8 +130,6 @@ fn (mut m Conn5) step_request() !core.Action {
 		return err
 	}
 	m.buf = m.buf[n..].clone()
-	m.pending_cmd = req.command
-	m.pending_addr = req.addr
 	match req.command {
 		.connect {
 			m.stage = .pending
