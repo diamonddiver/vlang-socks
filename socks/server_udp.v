@@ -31,7 +31,6 @@ fn (mut s Server) start_udp(mut pv picoev.Picoev, mut r Relay) {
 	}
 	r.udp = u
 	r.udp_fd = u.sock.handle
-	r.is_udp = true
 	bhost := uaddr.str().all_before_last(':')
 	bport := uaddr.str().all_after_last(':').u16()
 	act := r.m5.on_udp_bound(socks5.Addr{ atyp: .ipv4, host: bhost, port: bport })
@@ -59,22 +58,40 @@ fn (mut s Server) on_udp_readable(mut pv picoev.Picoev, fd int) {
 			return
 		}
 		// dg.addr.host is an IP literal here, so resolve_addrs does no DNS query.
-		taddrs := net.resolve_addrs('${dg.addr.host}:${dg.addr.port}', .ip, .udp) or { return }
-		if taddrs.len == 0 {
-			return
-		}
-		r.udp.write_to(taddrs[0], dg.data) or {}
+		taddr := resolve_first('${dg.addr.host}:${dg.addr.port}') or { return }
+		r.udp.write_to(taddr, dg.data) or {}
 	} else {
-		src := socks5.Addr{
-			atyp: .ipv4
-			host: peer_str.all_before_last(':')
-			port: peer_str.all_after_last(':').u16()
-		}
-		pkt := socks5.encode_udp_datagram(src, buf[..n])
-		caddrs := net.resolve_addrs(r.client_udp, .ip, .udp) or { return }
-		if caddrs.len == 0 {
-			return
-		}
-		r.udp.write_to(caddrs[0], pkt) or {}
+		pkt := build_udp_reply_datagram(peer, buf[..n]) or { return }
+		caddr := resolve_first(r.client_udp) or { return }
+		r.udp.write_to(caddr, pkt) or {}
 	}
+}
+
+// build_udp_reply_datagram encodes a target's reply as a SOCKS5 UDP datagram
+// addressed from peer. Returns none for an IPv6 peer: v1's ATYP is hardcoded
+// to .ipv4 here (see LIMITATIONS.md), and mis-encoding an IPv6 source as
+// ATYP=0x01 would silently corrupt the header (wrong address byte length)
+// rather than just fail loudly, so the datagram is dropped instead.
+fn build_udp_reply_datagram(peer net.Addr, data []u8) ?[]u8 {
+	if peer.family() == .ip6 {
+		return none
+	}
+	peer_str := peer.str()
+	src := socks5.Addr{
+		atyp: .ipv4
+		host: peer_str.all_before_last(':')
+		port: peer_str.all_after_last(':').u16()
+	}
+	return socks5.encode_udp_datagram(src, data)
+}
+
+// resolve_first resolves addr to its first candidate, or none on any failure
+// (unresolvable, or resolves to zero addresses) — the shared "best effort,
+// silently drop the datagram" shape both UDP relay directions use.
+fn resolve_first(addr string) ?net.Addr {
+	xs := net.resolve_addrs(addr, .ip, .udp) or { return none }
+	if xs.len == 0 {
+		return none
+	}
+	return xs[0]
 }

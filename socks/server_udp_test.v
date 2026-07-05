@@ -1,6 +1,7 @@
 module socks
 
 import net
+import socks.socks5
 
 fn test_server_udp_associate_roundtrip() {
 	mut target := net.listen_udp('127.0.0.1:0') or { panic(err) }
@@ -34,4 +35,26 @@ fn test_server_udp_associate_roundtrip() {
 	assert data == 'ping'.bytes()
 	assert who == taddr
 	sess.close()
+}
+
+fn test_build_udp_reply_datagram_encodes_ipv4_peer() {
+	peer := net.new_ip(80, [u8(127), 0, 0, 1]!)
+	pkt := build_udp_reply_datagram(peer, [u8(1), 2, 3]) or { panic('expected Some(pkt)') }
+	dg := socks5.parse_udp_datagram(pkt)!
+	assert dg.addr.atyp == .ipv4
+	assert dg.addr.host == '127.0.0.1'
+	assert dg.addr.port == 80
+	assert dg.data == [u8(1), 2, 3]
+}
+
+fn test_build_udp_reply_datagram_drops_ipv6_peer() {
+	// v1 has no correct IPv6-reply encoding (see LIMITATIONS.md): dropping is
+	// the safe choice over silently emitting a corrupted ATYP=0x01 header
+	// with mismatched (IPv6-length) address bytes.
+	addr := [u8(0x20), 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]!
+	peer := net.new_ip6(80, addr)
+	got := build_udp_reply_datagram(peer, [u8(1), 2, 3])
+	if _ := got {
+		assert false
+	}
 }
