@@ -5,7 +5,7 @@ MODULE     ?= socks
 CACHE_VOL  := vlang-socks-cache
 DOCKER_RUN := sudo docker run --rm -v $(CURDIR):/src -v $(CACHE_VOL):/root/.cache -w /src
 
-.PHONY: image test test-all vet fmt build run shell clean
+.PHONY: image test test-all vet fmt build run shell clean lib lib-all all
 
 # -d net_nonblocking_sockets: required so UDP (and TCP) read timeouts/deadlines
 # actually take effect at runtime instead of silently no-op'ing — see the
@@ -28,6 +28,18 @@ vet: image        ## What CI checks: fmt-verify + vet
 
 fmt: image        ## Auto-format in place
 	$(DOCKER_RUN) $(IMAGE) v fmt -w socks cmd
+
+# The container runs as root; build-lib.sh chowns its output back to
+# whichever host uid:gid ran `make`, so out/ doesn't end up root-owned.
+LIB_RUN := $(DOCKER_RUN) -e HOST_UID=$(shell id -u) -e HOST_GID=$(shell id -g)
+
+lib: image        ## Build shared (.so) + static (.a) + module-cache object for linux/amd64 -> out/linux_amd64/
+	$(LIB_RUN) $(IMAGE) ./scripts/build-lib.sh linux_amd64 "$(VFLAGS)"
+
+lib-all: image    ## Same, for every supported target: linux/amd64, linux/arm64, windows/amd64 -> out/<target>/
+	$(LIB_RUN) $(IMAGE) sh -c 'for t in linux_amd64 linux_arm64 windows_amd64; do ./scripts/build-lib.sh $$t "$(VFLAGS)"; done'
+
+all: lib-all      ## Alias for lib-all: every library artifact, every supported platform
 
 build:            ## Build the slim runtime image (compiled CLI, no toolchain)
 	sudo docker build --target runtime -t $(RUNTIME) .
