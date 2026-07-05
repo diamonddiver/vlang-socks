@@ -330,3 +330,27 @@ fn test_make_addr5_rejects_embedded_ipv4_form() {
 	}
 	assert false
 }
+
+// test_read_exact_raises_local_timeout guards against a regression: a
+// deadline firing on conn.read used to be wrapped as .protocol_error,
+// making a slow/hung proxy indistinguishable from a malformed reply. The
+// fake proxy here accepts but never writes, so the read deadline set below
+// is what fires (vlib reports this as an error whose msg() contains "timed
+// out", per the comment on test_dial_returned_conn_survives_short_idle's
+// sibling above documenting that exact wording).
+fn test_read_exact_raises_local_timeout() {
+	mut l, addr := spawn_fake_proxy(fn (mut c net.TcpConn) {}) or { panic(err) }
+	defer {
+		l.close() or {}
+	}
+	mut conn := net.dial_tcp(addr) or { panic(err) }
+	defer {
+		conn.close() or {}
+	}
+	conn.set_read_timeout(50 * time.millisecond)
+	read_exact(mut conn, 4) or {
+		assert (err as core.SocksError).kind == .local_timeout
+		return
+	}
+	assert false
+}

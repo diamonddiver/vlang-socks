@@ -198,6 +198,9 @@ fn read_exact(mut conn net.TcpConn, n int) ![]u8 {
 		// this exact view for the bytes to land in buf.
 		mut chunk := unsafe { buf[got..] }
 		r := conn.read(mut chunk) or {
+			if err.msg().contains('timed out') {
+				return core.err_cause(.local_timeout, 'read deadline exceeded', err)
+			}
 			return core.err_cause(.protocol_error, 'short read', err)
 		}
 		if r <= 0 {
