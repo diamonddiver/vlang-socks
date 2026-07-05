@@ -54,7 +54,11 @@ fn main() {
 		exit(1)
 	}
 	mut auth := socks.no_auth()
-	if user != '' && pass != '' {
+	if user != '' || pass != '' {
+		if user == '' || pass == '' {
+			eprintln('error: --user and --pass must both be set to enable user/pass auth')
+			exit(1)
+		}
 		auth = socks.user_pass_auth(user, pass)
 	}
 	cfg := socks.ServerConfig{
