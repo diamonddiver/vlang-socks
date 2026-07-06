@@ -2,3 +2,8 @@
 /docs/superpowers/
 /.superpowers/
 /.claude/
+
+# IDE / OS cruft
+.vscode/
+.idea/
+.DS_Store

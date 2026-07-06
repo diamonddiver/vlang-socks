@@ -4,6 +4,6 @@ Module {
 	version: '0.1.0'
 	license: 'MIT'
 	dependencies: []
-	repo_url: 'https://github.com/OWNER/vlang-socks'
-	author: 'Your Name <your.email@example.com>'
+	repo_url: 'https://github.com/diamonddiver/vlang-socks'
+	author: 'diamonddiver'
 }
