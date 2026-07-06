@@ -90,6 +90,15 @@ fn (mut m Conn5) step_handshake() !core.Action {
 	}
 }
 
+fn consteq(a []u8, b []u8) bool {
+	mut diff := u8(a.len != b.len)
+	n := if a.len < b.len { a.len } else { b.len }
+	for i in 0 .. n {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
+}
+
 fn (mut m Conn5) step_auth() !core.Action {
 	n := userpass_len(m.buf)
 	if n < 0 || m.buf.len < n {
@@ -97,7 +106,9 @@ fn (mut m Conn5) step_auth() !core.Action {
 	}
 	up := parse_userpass(m.buf[..n])!
 	m.buf = m.buf[n..].clone()
-	ok := up.user == m.cfg.username && up.pass == m.cfg.password
+	user_ok := consteq(up.user.bytes(), m.cfg.username.bytes())
+	pass_ok := consteq(up.pass.bytes(), m.cfg.password.bytes())
+	ok := user_ok && pass_ok
 	if !ok {
 		m.stage = .closed
 		return core.Action{

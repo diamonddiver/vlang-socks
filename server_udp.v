@@ -41,9 +41,13 @@ fn (mut s Server) start_udp(mut pv picoev.Picoev, mut r Relay) {
 	bhost := uaddr.str().all_before_last(':')
 	bport := uaddr.str().all_after_last(':').u16()
 	act := r.m5.on_udp_bound(socks5.Addr{ atyp: .ipv4, host: bhost, port: bport })
-	r.client.write(act.reply) or {
+	n := try_send(r.client_fd, act.reply) or {
 		s.close_relay(mut pv, mut r)
 		return
+	}
+	if n < act.reply.len {
+		r.client_out << act.reply[n..].clone()
+		s.sync_client_interest(mut pv, mut r)
 	}
 	r.relaying = true
 	r.last_activity = time.now()
