@@ -179,6 +179,87 @@ fn test_apply_queues_reply_remainder_when_client_buffer_full() {
 	assert received[pre_sent..] == reply
 }
 
+// test_send_reply_appends_behind_existing_backlog is the regression guard for
+// the ordering bug send_reply was extracted to fix: apply()/on_result()/
+// start_udp() each independently send a distinct SOCKS reply frame, and
+// on a saturated client socket, an EARLIER frame's still-queued remainder
+// must not be raced by a LATER frame's fresh try_send. This mirrors exactly
+// how apply() (a handshake/auth reply) and start_udp() (the UDP-bind reply)
+// can both queue into r.client_out for the same relay before the earlier
+// queue has drained.
+fn test_send_reply_appends_behind_existing_backlog() {
+	mut pv := picoev.new(picoev.Config{
+		port:   0
+		family: .ip
+	})!
+	mut srv := &Server{}
+
+	mut cl := net.listen_tcp(.ip, '127.0.0.1:0')!
+	caddr := cl.addr()!.str()
+	mut client_conn := net.dial_tcp(caddr)!
+	mut peer_client := cl.accept()!
+	cl.close() or {}
+	defer {
+		client_conn.close() or {}
+		peer_client.close() or {}
+	}
+
+	mut r := &Relay{
+		client:    client_conn
+		client_fd: client_conn.sock.handle
+	}
+
+	// Saturate the client socket's send path (peer_client never reads yet).
+	filler := []u8{len: 65536, init: u8(1)}
+	mut pre_sent := 0
+	mut blocked := false
+	for _ in 0 .. 500 {
+		n := try_send(r.client_fd, filler) or { panic(err) }
+		pre_sent += n
+		if n < filler.len {
+			blocked = true
+			break
+		}
+	}
+	assert blocked
+
+	// First reply frame (e.g. apply()'s handshake/auth reply): the pipe is
+	// full, so it must land entirely in client_out.
+	reply1 := [u8(0x05), 0x00]
+	assert srv.send_reply(mut pv, mut r, reply1)
+	assert r.client_out == reply1
+
+	// Second, distinct reply frame (e.g. start_udp()'s UDP-bind reply)
+	// arrives before reply1 has drained. It must be appended BEHIND reply1's
+	// still-queued bytes, not sent straight to the kernel ahead of them.
+	reply2 := [u8(0x05), 0x00, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef, 0x04, 0xd2]
+	mut want := reply1.clone()
+	want << reply2
+	assert srv.send_reply(mut pv, mut r, reply2)
+	assert r.client_out == want
+
+	// Drain the peer and confirm both frames arrive intact, in order,
+	// immediately after the filler.
+	total_expected := pre_sent + reply1.len + reply2.len
+	mut received := []u8{}
+	mut buf := []u8{len: 65536}
+	peer_client.set_read_timeout(500 * time.millisecond)
+	for received.len < total_expected {
+		n := peer_client.read(mut buf) or { break }
+		if n == 0 {
+			break
+		}
+		received << buf[..n]
+		if r.client_out.len > 0 {
+			srv.drain_client(mut pv, mut r)
+		}
+	}
+
+	assert r.client_out.len == 0
+	assert received.len == total_expected
+	assert received[pre_sent..] == want
+}
+
 fn fast_echo_target() !(&net.TcpListener, string) {
 	mut l := net.listen_tcp(.ip, '127.0.0.1:0')!
 	addr := l.addr()!.str()

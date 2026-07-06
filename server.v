@@ -371,19 +371,8 @@ fn (mut s Server) drive(mut pv picoev.Picoev, mut r Relay, data []u8) {
 }
 
 fn (mut s Server) apply(mut pv picoev.Picoev, mut r Relay, act core.Action) {
-	if act.reply.len > 0 {
-		// Small SOCKS reply frame. Non-blocking send; queue any unsent
-		// remainder so the full reply is guaranteed to reach the client in
-		// order before any later client_out bytes (see try_send's doc
-		// comment for why TcpConn.write is unusable here).
-		n := try_send(r.client_fd, act.reply) or {
-			s.close_relay(mut pv, mut r)
-			return
-		}
-		if n < act.reply.len {
-			r.client_out << act.reply[n..].clone()
-			s.sync_client_interest(mut pv, mut r)
-		}
+	if !s.send_reply(mut pv, mut r, act.reply) {
+		return
 	}
 	if act.close {
 		s.close_relay(mut pv, mut r)
@@ -495,20 +484,15 @@ fn (mut s Server) on_result(mut pv picoev.Picoev, res resolver.Result) {
 		} else {
 			r.m4.on_connected()
 		}
-		// SUCCESS reply. Queue any unsent remainder so the client is
-		// guaranteed the COMPLETE reply frame before any relay bytes: after
-		// this we set relaying=true and start forwarding target->client via
-		// send_to_client (which appends after client_out), so a partial
-		// reply left unqueued would let the client read relay data as the
-		// tail of the SOCKS reply => protocol desync. Sent BEFORE
-		// relaying=true / target registration so it always leads the queue.
-		n := try_send(r.client_fd, act.reply) or {
-			s.close_relay(mut pv, mut r)
+		// SUCCESS reply. send_reply guarantees the client gets the COMPLETE
+		// reply frame before any relay bytes: after this we set relaying=true
+		// and start forwarding target->client via send_to_client (which
+		// appends after client_out), so a partial reply left unqueued would
+		// let the client read relay data as the tail of the SOCKS reply =>
+		// protocol desync. Sent BEFORE relaying=true / target registration so
+		// it always leads the queue.
+		if !s.send_reply(mut pv, mut r, act.reply) {
 			return
-		}
-		if n < act.reply.len {
-			r.client_out << act.reply[n..].clone()
-			s.sync_client_interest(mut pv, mut r)
 		}
 		r.relaying = true
 		r.last_activity = time.now()
@@ -688,6 +672,32 @@ fn try_send(fd int, data []u8) !int {
 		return 0
 	}
 	return error('send failed: errno ${code}')
+}
+
+// send_reply delivers a single SOCKS reply frame (handshake/auth/connect/
+// udp-bind reply) to the client. Like send_to_target/send_to_client below, it
+// never sends ahead of an existing backlog: if client_out already has bytes
+// queued, the frame is appended behind them instead of racing a fresh
+// try_send in front of the backlog, which would let this frame's bytes reach
+// the wire before an earlier, still-queued frame's tail. Returns false
+// (having already closed the relay) on a hard send error; true otherwise,
+// including the no-op case of an empty reply.
+fn (mut s Server) send_reply(mut pv picoev.Picoev, mut r Relay, reply []u8) bool {
+	if reply.len == 0 {
+		return true
+	}
+	mut sent := 0
+	if r.client_out.len == 0 {
+		sent = try_send(r.client_fd, reply) or {
+			s.close_relay(mut pv, mut r)
+			return false
+		}
+	}
+	if sent < reply.len {
+		r.client_out << reply[sent..].clone()
+		s.sync_client_interest(mut pv, mut r)
+	}
+	return true
 }
 
 // send_to_target sends data toward the target, queuing whatever the kernel
