@@ -81,6 +81,28 @@ fn test_classify_unrecognized_error_is_internal() {
 	assert e.kind == .internal_error
 }
 
+fn test_resolver_resolve_kind_job_reports_addr() {
+	mut p := new(1, 0)
+	defer {
+		p.close()
+	}
+	p.submit(Job{
+		id:     3
+		target: core.Target{
+			host: '127.0.0.1'
+			port: 53
+		}
+		kind:   .resolve
+	})
+	r := <-p.results
+	assert r.id == 3
+	if _ := r.conn {
+		assert false // resolve-kind jobs never dial
+	}
+	addr := r.addr or { panic('expected an addr, got err') }
+	assert addr.str().all_before_last(':') == '127.0.0.1'
+}
+
 fn test_try_submit_reports_false_when_queue_full() {
 	// No workers spawned (constructed directly, not via new()), so nothing
 	// drains `jobs` — the queue stays exactly as full as we leave it.

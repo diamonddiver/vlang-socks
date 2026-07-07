@@ -3,6 +3,8 @@ module socks
 import net
 import time
 import picoev
+import socks.core
+import socks.resolver
 import socks.socks5
 
 // start_udp opens a UDP relay socket bound on the server's IP and replies with
@@ -73,6 +75,7 @@ fn (mut s Server) on_udp_readable(mut pv picoev.Picoev, fd int) {
 		}
 		dg := socks5.parse_udp_datagram(buf[..n]) or { return } // FRAG!=0 => dropped
 		if dg.addr.atyp == .domain {
+			s.handle_udp_domain(mut r, dg)
 			return
 		}
 		// dg.addr.host is an IP literal here, so resolve_addrs does no DNS query.
@@ -82,6 +85,53 @@ fn (mut s Server) on_udp_readable(mut pv picoev.Picoev, fd int) {
 		pkt := build_udp_reply_datagram(peer, buf[..n]) or { return }
 		caddr := resolve_first(r.client_udp) or { return }
 		r.udp.write_to(caddr, pkt) or {}
+	}
+}
+
+// handle_udp_domain forwards (or queues) a client->target datagram whose
+// DST.ADDR is a domain name. At most one resolve is kept in flight per
+// association: a datagram for a different domain than the one already being
+// resolved is dropped, since starting a second resolve would orphan the
+// first one's queue entry in s.pending and misroute its result.
+fn (mut s Server) handle_udp_domain(mut r Relay, dg socks5.UdpDatagram) {
+	if entry := r.udp_cache[dg.addr.host] {
+		if time.now() < entry.expires {
+			taddr := resolve_first('${entry.ip}:${dg.addr.port}') or { return }
+			r.udp.write_to(taddr, dg.data) or {}
+			return
+		}
+	}
+	if r.udp_resolve_job != 0 {
+		if r.udp_resolve_domain == dg.addr.host {
+			r.udp_resolve_queue << UdpPendingDgram{
+				data: dg.data
+				port: dg.addr.port
+			}
+			if r.udp_resolve_queue.len > udp_resolve_queue_cap {
+				r.udp_resolve_queue = r.udp_resolve_queue[1..]
+			}
+		}
+		// Different domain already in flight: drop silently.
+		return
+	}
+	s.next_id++
+	id := s.next_id
+	if !s.pool.try_submit(resolver.Job{
+		id:     id
+		target: core.Target{
+			host: dg.addr.host
+			port: dg.addr.port
+		}
+		kind:   .resolve
+	}) {
+		return
+	}
+	r.udp_resolve_domain = dg.addr.host
+	r.udp_resolve_job = id
+	s.pending[id] = r
+	r.udp_resolve_queue << UdpPendingDgram{
+		data: dg.data
+		port: dg.addr.port
 	}
 }
 

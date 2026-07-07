@@ -18,6 +18,17 @@ const sweep_tick = 1 * time.second
 // read interest is paused until the queue drains back under it.
 const relay_hwm = 256 * 1024
 
+// udp_dns_cache_ttl / udp_dns_cache_cap bound how long and how many
+// domain -> IP results a relay caches after a UDP domain-typed resolve, to
+// avoid re-resolving every datagram to the same domain.
+const udp_dns_cache_ttl = 30 * time.second
+
+const udp_dns_cache_cap = 64
+
+// udp_resolve_queue_cap bounds how many datagrams a relay buffers while a
+// UDP domain resolve is in flight (drop-oldest on overflow).
+const udp_resolve_queue_cap = 16
+
 // Fd role in the event loop.
 enum FdRole {
 	listener
@@ -64,6 +75,22 @@ mut:
 	udp        &net.UdpConn = unsafe { nil }
 	udp_fd     int          = -1
 	client_udp string
+	// UDP domain-typed target resolution: at most one resolve job in flight
+	// per association, with datagrams to that same domain queued behind it.
+	udp_resolve_domain string
+	udp_resolve_job    u64 // id of this relay's outstanding UDP resolve job (0 = none)
+	udp_resolve_queue  []UdpPendingDgram
+	udp_cache          map[string]UdpCacheEntry
+}
+
+struct UdpPendingDgram {
+	data []u8
+	port u16
+}
+
+struct UdpCacheEntry {
+	ip      string
+	expires time.Time
 }
 
 struct Server {
@@ -463,6 +490,10 @@ fn (mut s Server) on_result(mut pv picoev.Picoev, res resolver.Result) {
 		}
 		return
 	}
+	if r.udp_resolve_job == res.id {
+		s.on_udp_resolve_result(mut r, res)
+		return
+	}
 	s.pending.delete(res.id)
 	r.conn_id = 0
 	if mut tconn := res.conn {
@@ -525,6 +556,42 @@ fn (mut s Server) on_result(mut pv picoev.Picoev, res resolver.Result) {
 	}
 }
 
+// on_udp_resolve_result handles a resolver result for a UDP domain-typed
+// target: on success, caches the resolved IP and forwards every datagram
+// queued behind this resolve; on failure, drops them all silently (matching
+// the existing best-effort UDP relay semantics).
+fn (mut s Server) on_udp_resolve_result(mut r Relay, res resolver.Result) {
+	s.pending.delete(res.id)
+	r.udp_resolve_job = 0
+	domain := r.udp_resolve_domain
+	r.udp_resolve_domain = ''
+	queue := r.udp_resolve_queue.clone()
+	r.udp_resolve_queue = []
+	addr := res.addr or { return }
+	host := addr.str().all_before_last(':')
+	if r.udp_cache.len >= udp_dns_cache_cap && domain !in r.udp_cache {
+		mut oldest_k := ''
+		mut oldest_t := time.now().add(1000 * time.hour)
+		for k, v in r.udp_cache {
+			if v.expires < oldest_t {
+				oldest_t = v.expires
+				oldest_k = k
+			}
+		}
+		if oldest_k != '' {
+			r.udp_cache.delete(oldest_k)
+		}
+	}
+	r.udp_cache[domain] = UdpCacheEntry{
+		ip:      host
+		expires: time.now().add(udp_dns_cache_ttl)
+	}
+	for dg in queue {
+		taddr := resolve_first('${host}:${dg.port}') or { continue }
+		r.udp.write_to(taddr, dg.data) or {}
+	}
+}
+
 fn (mut s Server) on_target_readable(mut pv picoev.Picoev, fd int) {
 	mut r := s.relays[fd] or { return }
 	data := s.read_some(mut r.target) or {
@@ -554,6 +621,12 @@ fn (mut s Server) close_relay(mut pv picoev.Picoev, mut r Relay) {
 		s.pending.delete(r.conn_id)
 		r.conn_id = 0
 	}
+	if r.udp_resolve_job != 0 {
+		s.pending.delete(r.udp_resolve_job)
+		r.udp_resolve_job = 0
+	}
+	r.udp_resolve_domain = ''
+	r.udp_resolve_queue = []
 	if r.client_fd >= 0 {
 		pv_del(mut pv, r.client_fd)
 		s.roles.delete(r.client_fd)
