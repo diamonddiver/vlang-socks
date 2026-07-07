@@ -38,9 +38,12 @@ fn (mut s Server) start_udp(mut pv picoev.Picoev, mut r Relay) {
 	}
 	r.udp = u
 	r.udp_fd = u.sock.handle
-	bhost := uaddr.str().all_before_last(':')
-	bport := uaddr.str().all_after_last(':').u16()
-	act := r.m5.on_udp_bound(socks5.Addr{ atyp: .ipv4, host: bhost, port: bport })
+	bhost, bport := split_host_port(uaddr.str()) or {
+		s.fail_relay(mut pv, mut r, .general_failure)
+		return
+	}
+	batyp := if uaddr.family() == .ip6 { socks5.AddrType.ipv6 } else { socks5.AddrType.ipv4 }
+	act := r.m5.on_udp_bound(socks5.Addr{ atyp: batyp, host: bhost, port: bport })
 	if !s.send_reply(mut pv, mut r, act.reply) {
 		return
 	}
@@ -93,19 +96,14 @@ fn tcp_client_ip(r &Relay) string {
 }
 
 // build_udp_reply_datagram encodes a target's reply as a SOCKS5 UDP datagram
-// addressed from peer. Returns none for an IPv6 peer: v1's ATYP is hardcoded
-// to .ipv4 here (see LIMITATIONS.md), and mis-encoding an IPv6 source as
-// ATYP=0x01 would silently corrupt the header (wrong address byte length)
-// rather than just fail loudly, so the datagram is dropped instead.
+// addressed from peer, handling both IPv4 and IPv6 peers.
 fn build_udp_reply_datagram(peer net.Addr, data []u8) ?[]u8 {
-	if peer.family() == .ip6 {
-		return none
-	}
-	peer_str := peer.str()
+	host, port := split_host_port(peer.str()) or { return none }
+	atyp := if peer.family() == .ip6 { socks5.AddrType.ipv6 } else { socks5.AddrType.ipv4 }
 	src := socks5.Addr{
-		atyp: .ipv4
-		host: peer_str.all_before_last(':')
-		port: peer_str.all_after_last(':').u16()
+		atyp: atyp
+		host: host
+		port: port
 	}
 	return socks5.encode_udp_datagram(src, data)
 }

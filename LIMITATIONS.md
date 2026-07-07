@@ -65,15 +65,6 @@ hostile traffic.
   datagram addresses its target by domain name (ATYP=domain) rather than an
   IP literal, the datagram is silently dropped rather than resolved.
 
-- **UDP ASSOCIATE: IPv6 target/reply handling is incomplete.** The UDP relay's
-  bound-address reply always encodes `ATYP=ipv4`, regardless of whether the
-  actual address is IPv4 or IPv6. A target replying from an IPv6 source is
-  handled safely, not silently: `on_udp_readable` detects an IPv6 peer and
-  drops the datagram rather than mis-encoding it as `ATYP=ipv4` with
-  IPv6-length address bytes (which would corrupt the header). IPv6 targets
-  are therefore unreachable via UDP ASSOCIATE in v1, but the failure mode is
-  a dropped packet, not wire corruption.
-
 - **UDP datagram fragmentation is not supported.** Any datagram with
   `FRAG != 0x00` is rejected outright rather than reassembled (by design —
   see the project's scope notes — but worth calling out here too).
