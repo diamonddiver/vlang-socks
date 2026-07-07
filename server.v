@@ -316,11 +316,11 @@ fn (mut s Server) on_accept(mut pv picoev.Picoev) {
 fn (mut s Server) on_client_readable(mut pv picoev.Picoev, fd int) {
 	mut r := s.relays[fd] or { return }
 	data := s.read_some(mut r.client) or {
-		s.close_relay(mut pv, mut r)
+		s.close_relay(mut pv, mut r, none)
 		return
 	}
 	if data.len == 0 {
-		s.close_relay(mut pv, mut r)
+		s.close_relay(mut pv, mut r, none)
 		return
 	}
 	r.last_activity = time.now()
@@ -340,7 +340,7 @@ fn (mut s Server) drive(mut pv picoev.Picoev, mut r Relay, data []u8) {
 	mut feed := data.clone()
 	if r.m5 == unsafe { nil } && r.m4 == unsafe { nil } {
 		fam := dispatch_family(feed[0], s.cfg) or {
-			s.close_relay(mut pv, mut r)
+			s.close_relay(mut pv, mut r, none)
 			return
 		}
 		r.fam = fam
@@ -358,12 +358,12 @@ fn (mut s Server) drive(mut pv picoev.Picoev, mut r Relay, data []u8) {
 	}
 	act := if r.fam == .socks5 {
 		r.m5.feed(feed) or {
-			s.close_relay(mut pv, mut r)
+			s.close_relay(mut pv, mut r, none)
 			return
 		}
 	} else {
 		r.m4.feed(feed) or {
-			s.close_relay(mut pv, mut r)
+			s.close_relay(mut pv, mut r, none)
 			return
 		}
 	}
@@ -375,7 +375,7 @@ fn (mut s Server) apply(mut pv picoev.Picoev, mut r Relay, act core.Action) {
 		return
 	}
 	if act.close {
-		s.close_relay(mut pv, mut r)
+		s.close_relay(mut pv, mut r, none)
 		return
 	}
 	if act.udp_associate {
@@ -440,11 +440,11 @@ fn (mut s Server) sweep_timeouts(mut pv picoev.Picoev) {
 		}
 		if r.relaying {
 			if s.cfg.idle_timeout > 0 && now - r.last_activity > s.cfg.idle_timeout {
-				s.close_relay(mut pv, mut r)
+				s.close_relay(mut pv, mut r, none)
 			}
 		} else {
 			if s.cfg.handshake_timeout > 0 && now - r.accepted_at > s.cfg.handshake_timeout {
-				s.close_relay(mut pv, mut r)
+				s.close_relay(mut pv, mut r, core.SocksErrorCode.local_timeout)
 			}
 		}
 	}
@@ -528,11 +528,11 @@ fn (mut s Server) on_result(mut pv picoev.Picoev, res resolver.Result) {
 fn (mut s Server) on_target_readable(mut pv picoev.Picoev, fd int) {
 	mut r := s.relays[fd] or { return }
 	data := s.read_some(mut r.target) or {
-		s.close_relay(mut pv, mut r)
+		s.close_relay(mut pv, mut r, none)
 		return
 	}
 	if data.len == 0 {
-		s.close_relay(mut pv, mut r)
+		s.close_relay(mut pv, mut r, none)
 		return
 	}
 	r.last_activity = time.now()
@@ -546,10 +546,13 @@ fn (mut s Server) fail_relay(mut pv picoev.Picoev, mut r Relay, kind core.SocksE
 		r.m4.on_failed(kind)
 	}
 	try_send(r.client_fd, act.reply) or {}
-	s.close_relay(mut pv, mut r)
+	s.close_relay(mut pv, mut r, none)
 }
 
-fn (mut s Server) close_relay(mut pv picoev.Picoev, mut r Relay) {
+fn (mut s Server) close_relay(mut pv picoev.Picoev, mut r Relay, reason ?core.SocksErrorCode) {
+	if s.cfg.log_connections {
+		println('close fd=${r.client_fd} reason=${reason}')
+	}
 	if r.conn_id != 0 {
 		s.pending.delete(r.conn_id)
 		r.conn_id = 0
@@ -594,7 +597,7 @@ fn (mut s Server) shutdown(mut pv picoev.Picoev) {
 	// `or { continue }` and is skipped.
 	for fd, _ in s.relays.clone() {
 		mut r := s.relays[fd] or { continue }
-		s.close_relay(mut pv, mut r)
+		s.close_relay(mut pv, mut r, none)
 	}
 	// The notify pair is Server-owned and, unlike every relay fd, had no other
 	// cleanup path: request_stop() (external thread) only closes s.listener,
@@ -689,7 +692,7 @@ fn (mut s Server) send_reply(mut pv picoev.Picoev, mut r Relay, reply []u8) bool
 	mut sent := 0
 	if r.client_out.len == 0 {
 		sent = try_send(r.client_fd, reply) or {
-			s.close_relay(mut pv, mut r)
+			s.close_relay(mut pv, mut r, none)
 			return false
 		}
 	}
@@ -707,7 +710,7 @@ fn (mut s Server) send_reply(mut pv picoev.Picoev, mut r Relay, reply []u8) bool
 fn (mut s Server) send_to_target(mut pv picoev.Picoev, mut r Relay, data []u8) {
 	if r.target_out.len == 0 {
 		n := try_send(r.target_fd, data) or {
-			s.close_relay(mut pv, mut r)
+			s.close_relay(mut pv, mut r, none)
 			return
 		}
 		if n < data.len {
@@ -725,7 +728,7 @@ fn (mut s Server) send_to_target(mut pv picoev.Picoev, mut r Relay, data []u8) {
 fn (mut s Server) send_to_client(mut pv picoev.Picoev, mut r Relay, data []u8) {
 	if r.client_out.len == 0 {
 		n := try_send(r.client_fd, data) or {
-			s.close_relay(mut pv, mut r)
+			s.close_relay(mut pv, mut r, none)
 			return
 		}
 		if n < data.len {
@@ -743,7 +746,7 @@ fn (mut s Server) send_to_client(mut pv picoev.Picoev, mut r Relay, data []u8) {
 // slicing off whatever the kernel accepted this time.
 fn (mut s Server) drain_target(mut pv picoev.Picoev, mut r Relay) {
 	n := try_send(r.target_fd, r.target_out) or {
-		s.close_relay(mut pv, mut r)
+		s.close_relay(mut pv, mut r, none)
 		return
 	}
 	r.target_out = r.target_out[n..]
@@ -755,7 +758,7 @@ fn (mut s Server) drain_target(mut pv picoev.Picoev, mut r Relay) {
 // drain_client mirrors drain_target for the client direction.
 fn (mut s Server) drain_client(mut pv picoev.Picoev, mut r Relay) {
 	n := try_send(r.client_fd, r.client_out) or {
-		s.close_relay(mut pv, mut r)
+		s.close_relay(mut pv, mut r, none)
 		return
 	}
 	r.client_out = r.client_out[n..]
