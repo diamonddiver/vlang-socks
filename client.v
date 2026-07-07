@@ -56,28 +56,7 @@ pub fn dial(cfg ClientConfig, target_addr string) !net.TcpConn {
 }
 
 fn dial5(mut conn net.TcpConn, cfg ClientConfig, host string, port u16) ! {
-	is_userpass := cfg.auth is UserPassAuth
-	methods := if is_userpass {
-		[socks5.method_user_pass]
-	} else {
-		[socks5.method_no_auth]
-	}
-	conn.write(socks5.encode_hello(methods))!
-	sel := socks5.parse_method_select(read_exact(mut conn, 2)!)!
-	if sel == socks5.method_none {
-		return core.err(.auth_method_not_acceptable, 'proxy rejected all auth methods')
-	}
-	if sel == socks5.method_user_pass {
-		up := cfg.auth as UserPassAuth
-		if up.user.len > 255 || up.pass.len > 255 {
-			return core.err(.protocol_error, 'socks: username/password must each be 255 bytes or fewer')
-		}
-		conn.write(socks5.encode_userpass(socks5.UserPass{ user: up.user, pass: up.pass }))!
-		ok := socks5.parse_userpass_reply(read_exact(mut conn, 2)!)!
-		if !ok {
-			return core.err(.auth_failed, 'proxy rejected credentials')
-		}
-	}
+	socks5_client_auth(mut conn, cfg)!
 	addr := make_addr5(host, port, cfg.resolve_mode)!
 	conn.write(socks5.encode_request(socks5.Request{ command: .connect, addr: addr }))!
 	rep := read_reply5(mut conn)!
@@ -282,6 +261,12 @@ fn is_ipv6(s string) bool {
 		}
 	}
 	return true
+}
+
+// is_ip_literal reports whether host is an IPv4 or IPv6 literal (as opposed
+// to a domain name needing resolution).
+fn is_ip_literal(host string) bool {
+	return is_ipv4(host) || is_ipv6(host)
 }
 
 // resolve_ipv4 resolves a domain name to a dotted IPv4 string (client_side mode

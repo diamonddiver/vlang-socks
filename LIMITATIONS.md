@@ -47,9 +47,8 @@ arbitrary internet clients.
 What remains for exposing this directly to arbitrary untrusted internet clients
 is out-of-scope-for-v1 **policy**, not the stall risks above: there is no egress
 filtering (SSRF to loopback/link-local/RFC1918/metadata targets), no per-source
-connection or rate limiting, and the UDP / `resolve_mode` gaps below. Enable
-`idle_timeout` and put a rate-limiter / egress policy in front before serving
-hostile traffic.
+connection or rate limiting, and the UDP gaps below. Enable `idle_timeout` and
+put a rate-limiter / egress policy in front before serving hostile traffic.
 
 ## Protocol / addressing limitations
 
@@ -61,24 +60,18 @@ hostile traffic.
   step, so a peer that races the real client for the first datagram can hijack
   the association.
 
-- **UDP ASSOCIATE: domain-typed targets are dropped.** If a client's UDP
-  datagram addresses its target by domain name (ATYP=domain) rather than an
-  IP literal, the datagram is silently dropped rather than resolved.
+- **UDP ASSOCIATE: domain-typed targets are resolved server-side, unless
+  `resolve_mode` is `.client_side`.** A client's UDP datagram addressing its
+  target by domain name (ATYP=domain) is resolved through the resolver pool
+  and cached per-association; with `resolve_mode` set to `.client_side` the
+  datagram is silently dropped instead (UDP has no per-datagram error channel
+  back to the client), matching the CONNECT path's refusal.
 
 - **UDP datagram fragmentation is not supported.** Any datagram with
   `FRAG != 0x00` is rejected outright rather than reassembled (by design —
   see the project's scope notes — but worth calling out here too).
 
 ## Configuration
-
-- **`ServerConfig.resolve_mode` is not consulted by the server.** Setting it
-  to `.client_side` has no effect: `apply()` always hands every `CONNECT`
-  target (including domain names) to the resolver pool for server-side DNS
-  resolution regardless of this field. A caller relying on `.client_side` to
-  make the server refuse to resolve domain names itself (e.g. as an
-  SSRF-avoidance policy, requiring clients to pre-resolve and send IP
-  literals) gets silently ignored configuration. `ClientConfig.resolve_mode`
-  is unaffected by this — it works as documented for `dial()`/`udp_associate()`.
 
 - **`SocksErrorCode.local_timeout` and `.internal_error` are raised only on
   specific paths.** Both are now produced: a client-side read that fails on
@@ -112,5 +105,5 @@ relays can be reaped (`handshake_timeout` / `idle_timeout`), the connection coun
 is capped (`max_connections`), and stuck dials free their worker slot
 (`connect_timeout`). What remains for a public-internet deployment is
 out-of-scope-for-v1 policy — egress/SSRF filtering, per-source rate limiting, and
-the UDP / `resolve_mode` gaps above. Enable `idle_timeout` and front the server
-with a rate-limiter before exposing it to arbitrary untrusted clients.
+the UDP gaps above. Enable `idle_timeout` and front the server with a
+rate-limiter before exposing it to arbitrary untrusted clients.

@@ -92,8 +92,7 @@ pub fn (mut s UdpSession) close() {
 }
 
 // socks5_client_auth performs the method negotiation (+ optional user/pass)
-// portion of a SOCKS5 client handshake. Shared by udp_associate; dial5 inlines
-// the same sequence.
+// portion of a SOCKS5 client handshake. Shared by udp_associate and dial5.
 fn socks5_client_auth(mut conn net.TcpConn, cfg ClientConfig) ! {
 	is_userpass := cfg.auth is UserPassAuth
 	methods := if is_userpass {

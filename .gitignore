@@ -1,7 +1,7 @@
 /out/
-/docs/superpowers/
 /.superpowers/
 /.claude/
+/CLAUDE.md
 
 # IDE / OS cruft
 .vscode/

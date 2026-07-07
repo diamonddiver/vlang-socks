@@ -410,6 +410,13 @@ fn (mut s Server) apply(mut pv picoev.Picoev, mut r Relay, act core.Action) {
 		return
 	}
 	if t := act.connect {
+		if s.cfg.resolve_mode == .client_side && !is_ip_literal(t.host) {
+			// .client_side means the server must not resolve domain names
+			// itself; a client that sent one anyway is refused instead of
+			// silently falling back to server-side DNS.
+			s.fail_relay(mut pv, mut r, .address_type_not_supported)
+			return
+		}
 		if s.cfg.log_connections {
 			ver := if r.fam == .socks5 { 'socks5' } else { 'socks4' }
 			src := if a := r.client.peer_addr() { a.str() } else { '?' }

@@ -3,6 +3,18 @@ module capi
 import socks
 import socks.core
 
+// pending_dgram caches a datagram already pulled off the socket whose
+// destination buffer turned out to be too small, so a retry with a bigger
+// buffer can deliver it instead of losing it.
+struct PendingDgram {
+	addr string
+	data []u8
+}
+
+__global (
+	pending map[u64]PendingDgram
+)
+
 // socks_udp_associate opens a SOCKS5 UDP association and returns a registry
 // handle (0 on failure). auth_mode/resolve_mode: same encoding as
 // socks_dial. Always negotiates SOCKS5 (UDP ASSOCIATE requires it).
@@ -55,6 +67,10 @@ pub fn udp_write_to(id u64, addr &char, data &u8, len int) int {
 // "host:port" (NUL-terminated) into addr_buf and its payload into data_buf.
 // Returns the payload length, or -1 on failure / unknown handle / either
 // buffer too small (addr_cap must include room for the NUL terminator).
+//
+// A too-small buffer does not discard the datagram: it is cached and
+// re-delivered (without a fresh socket read) on the next call, so the caller
+// can retry with a bigger buffer.
 @[export: 'socks_udp_read_from']
 pub fn udp_read_from(id u64, addr_buf &char, addr_cap int, data_buf &u8, data_cap int) int {
 	reg_mu.@lock()
@@ -63,14 +79,33 @@ pub fn udp_read_from(id u64, addr_buf &char, addr_cap int, data_buf &u8, data_ca
 		set_error(int(core.SocksErrorCode.internal_error), 'socks_udp_read_from: invalid handle')
 		return -1
 	}
+	cached := pending[id]
 	reg_mu.unlock()
-	addr, data := sess.read_from() or {
-		record_error(err)
-		return -1
+
+	mut addr := cached.addr
+	mut data := cached.data.clone()
+	if addr == '' {
+		a, d := sess.read_from() or {
+			record_error(err)
+			return -1
+		}
+		addr = a
+		data = d.clone()
 	}
 	if data.len > data_cap || addr.len >= addr_cap {
+		reg_mu.@lock()
+		pending[id] = PendingDgram{
+			addr: addr
+			data: data
+		}
+		reg_mu.unlock()
 		set_error(int(core.SocksErrorCode.internal_error), 'socks_udp_read_from: buffer too small')
 		return -1
+	}
+	if cached.addr != '' {
+		reg_mu.@lock()
+		pending.delete(id)
+		reg_mu.unlock()
 	}
 	unsafe {
 		mut ab := &u8(addr_buf)
@@ -91,6 +126,7 @@ pub fn udp_close(id u64) {
 		return
 	}
 	sessions.delete(id)
+	pending.delete(id)
 	reg_mu.unlock()
 	sess.close()
 }

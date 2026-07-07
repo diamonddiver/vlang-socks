@@ -97,6 +97,13 @@ fn (mut s Server) on_udp_readable(mut pv picoev.Picoev, fd int) {
 // resolved is dropped, since starting a second resolve would orphan the
 // first one's queue entry in s.pending and misroute its result.
 fn (mut s Server) handle_udp_domain(mut r Relay, dg socks5.UdpDatagram) {
+	if s.cfg.resolve_mode == .client_side {
+		// .client_side means the server must not resolve domain names itself;
+		// a client sending a domain-typed UDP datagram anyway is dropped
+		// silently (UDP relay has no per-datagram error channel back to the
+		// client), same as apply()'s CONNECT-path refusal.
+		return
+	}
 	if entry := r.udp_cache[dg.addr.host] {
 		if time.now() < entry.expires {
 			taddr := resolve_first('${entry.ip}:${dg.addr.port}') or { return }
