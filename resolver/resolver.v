@@ -4,16 +4,23 @@ import net
 import time
 import socks.core
 
+pub enum JobKind {
+	connect
+	resolve
+}
+
 pub struct Job {
 pub:
 	id     u64
 	target core.Target
+	kind   JobKind
 }
 
 pub struct Result {
 pub:
 	id   u64
 	conn ?&net.TcpConn
+	addr ?net.Addr
 	err  ?core.SocksError
 }
 
@@ -98,11 +105,36 @@ pub fn new_for_test(queue_cap int) Pool {
 fn worker(jobs chan Job, results chan Result, connect_timeout time.Duration) {
 	for {
 		job := <-jobs or { break } // channel closed => exit
-		if connect_timeout <= 0 {
+		if job.kind == .resolve {
+			resolve_and_report(job, results)
+		} else if connect_timeout <= 0 {
 			dial_and_report(job, results)
 		} else {
 			run_with_timeout(job, results, connect_timeout)
 		}
+	}
+}
+
+// resolve_and_report performs a blocking DNS-only resolve (no connect) and
+// reports the outcome on results.
+fn resolve_and_report(job Job, results chan Result) {
+	xs := net.resolve_addrs(dial_addr(job.target), .ip, .udp) or {
+		results <- Result{
+			id:  job.id
+			err: classify(err, job.target)
+		}
+		return
+	}
+	if xs.len == 0 {
+		results <- Result{
+			id:  job.id
+			err: core.err(.host_unreachable, job.target.host)
+		}
+		return
+	}
+	results <- Result{
+		id:   job.id
+		addr: xs[0]
 	}
 }
 
